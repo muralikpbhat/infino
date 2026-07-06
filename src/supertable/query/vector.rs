@@ -611,18 +611,12 @@ impl SupertableReader {
             segs.dedup();
             segs.len()
         };
-        // `nprobe` = probe the globally closest `nprobe` fine IVF centroids.
-        // Score every resident centroid, keep the top `nprobe`, fan out to
-        // those lists only. Coarse cell routing (limiting to a handful of
-        // storage cells before centroid ranking) was the recall bug — not this.
-        // User table (pre-drain): each superfile is its own IVF shard, so the
-        // budget is `nprobe × eligible_superfiles` centroids ranked globally.
-        // `INFINO_INNER_BUDGET` overrides with an absolute centroid count.
-        let default_budget = if is_hidden_vector_index_table(&manifest.options) {
-            nprobe.max(1)
-        } else {
-            nprobe.saturating_mul(n_eligible.max(1)).max(nprobe)
-        };
+        // Inner-cluster budget: probe the globally-closest
+        // `nprobe × eligible_superfiles` fine IVF centroids across all eligible
+        // superfiles — near superfiles get more of their clusters probed, far
+        // ones fewer or none. `INFINO_INNER_BUDGET` overrides with an absolute
+        // centroid count.
+        let default_budget = nprobe.saturating_mul(n_eligible.max(1)).max(nprobe);
         let budget = std::env::var("INFINO_INNER_BUDGET")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
