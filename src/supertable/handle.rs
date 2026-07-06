@@ -274,7 +274,12 @@ impl Supertable {
             })?
             .clone();
         let options_arc = Arc::new(options);
+        let _open_timers = std::env::var_os("INFINO_OPEN_TIMERS").is_some();
+        let _t = std::time::Instant::now();
         let manifest = Manifest::load(None, storage, Some(options_arc.clone())).await?;
+        if _open_timers {
+            eprintln!("[open-timer] user manifest load: {:.1}ms", _t.elapsed().as_secs_f64() * 1e3);
+        }
         let vector_index_table = if let Some(hidden_opts) =
             build_vector_index_options(options_arc.as_ref(), Some(manifest.as_ref()), None)
         {
@@ -286,11 +291,22 @@ impl Supertable {
             match crate::supertable::manifest::commit::read_pointer(&*hidden_storage).await {
                 Ok(Some(_)) => {
                     let hidden_arc = Arc::new(hidden_opts);
+                    let _t = std::time::Instant::now();
                     match Manifest::load(None, hidden_storage, Some(hidden_arc.clone())).await {
-                        Ok(hidden_manifest) => open_table_async(hidden_arc, hidden_manifest, None)
+                        Ok(hidden_manifest) => {
+                            if _open_timers {
+                                eprintln!("[open-timer] hidden manifest load: {:.1}ms ({} parts, {} superfiles)", _t.elapsed().as_secs_f64() * 1e3, hidden_manifest.get_num_parts(), hidden_manifest.superfiles.len());
+                            }
+                            let _t = std::time::Instant::now();
+                            let r = open_table_async(hidden_arc, hidden_manifest, None)
                             .await
                             .ok()
-                            .map(Arc::new),
+                            .map(Arc::new);
+                            if _open_timers {
+                                eprintln!("[open-timer] hidden build_handle (recovery+gc sweep): {:.1}ms", _t.elapsed().as_secs_f64() * 1e3);
+                            }
+                            r
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 "supertable: hidden vector-index table unavailable: {e}"
@@ -820,22 +836,16 @@ impl Supertable {
         let hidden = self.inner.vector_index_table.as_ref()?;
         let reader = hidden.reader();
         let manifest = reader.manifest();
+        // Parts are size-bucketed at the table level and no longer carry a
+        // partition key of their own — the per-cell tag lives on each superfile
+        // entry. Bucket the flat superfile view (kept resident for the hidden
+        // index) by each entry's own `partition_key`.
         let mut by_cell: HashMap<Vec<u8>, usize> = HashMap::new();
         let flat_superfiles = manifest.get_all_superfiles();
-        let total = if flat_superfiles.is_empty() {
-            let mut total = 0usize;
-            for entry in manifest.get_all_list_entries() {
-                let n_superfiles = entry.n_superfiles as usize;
-                total = total.saturating_add(n_superfiles);
-                *by_cell.entry(entry.partition_key.clone()).or_default() += n_superfiles;
-            }
-            total
-        } else {
-            for entry in flat_superfiles {
-                *by_cell.entry(entry.partition_key.clone()).or_default() += 1;
-            }
-            flat_superfiles.len()
-        };
+        for entry in flat_superfiles {
+            *by_cell.entry(entry.partition_key.clone()).or_default() += 1;
+        }
+        let total = flat_superfiles.len();
         if total == 0 {
             return Some((0, 0));
         }
@@ -916,7 +926,14 @@ impl Supertable {
 /// holding) can be wired here if a workload ever needs it —
 /// but that is a *bounded* set, never the whole manifest.
 /// Default number of global vector-index cells for routed search.
-pub(crate) const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
+/// Overridable at runtime via `INFINO_GLOBAL_VECTOR_CELL_COUNT` (bench/ops).
+pub(crate) fn global_vector_cell_count() -> usize {
+    std::env::var("INFINO_GLOBAL_VECTOR_CELL_COUNT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(64)
+}
 
 /// Reserved VectorCell partition id for the hidden index's "incoming" append
 /// region. Each hidden commit writes one IVF superfile under this sentinel
@@ -934,13 +951,6 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_ITERS: usize = 8;
 /// Fixed PRNG seed for global centroid training.
 pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 
-/// Eager-load every part of a hidden vector-index manifest whose part count is
-/// at or below this. Set high enough to keep the whole cell manifest eager: the
-/// grid shards one part per cell, and lazy open resolves the routed cells' parts
-/// one at a time (serial), so cold search cost would otherwise grow with cell
-/// count. Eager instead loads all parts once at open, in parallel, and the query
-/// prunes cells in memory — reading only the routed cells' data.
-const HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD: u32 = 1_000_000;
 
 /// Headroom an engine-managed (auto-sized) cache budget keeps over the
 /// table's on-storage footprint, in divisor form (`footprint +
@@ -1100,14 +1110,13 @@ fn build_vector_index_options(
     .ok()?;
     hidden_opts = hidden_opts
         .with_storage(Arc::clone(&sub_storage))
-        .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf)
-        .with_eager_load_threshold(HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD);
+        .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf);
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }
     if let Some(manifest) = user_manifest
         && let Some(clusters) =
-            train_global_centroids(user_opts, manifest, GLOBAL_VECTOR_CELL_COUNT)
+            train_global_centroids(user_opts, manifest, global_vector_cell_count())
     {
         hidden_opts = hidden_opts.with_partition_strategy(
             crate::supertable::manifest::list::PartitionStrategy::VectorCell {

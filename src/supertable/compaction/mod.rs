@@ -455,7 +455,6 @@ impl Supertable {
             }
         };
 
-        let partition_key = job.partition_key.clone();
         let partition_hint = inputs.first().and_then(|e| e.partition_hint);
         let merged_old = merged_segment.entry.as_ref();
         let merged_entry = Arc::new(SuperfileEntry {
@@ -471,7 +470,9 @@ impl Supertable {
             scalar_stats: merged_old.scalar_stats.clone(),
             fts_summary: merged_old.fts_summary.clone(),
             vector_summary: merged_old.vector_summary.clone(),
-            partition_key,
+            // Left empty: the manifest's `update()` stamps the
+            // partition key at commit time from `partition_hint`.
+            partition_key: Vec::new(),
             partition_hint,
             subsection_offsets: merged_old.subsection_offsets.clone(),
             vector_layout: inputs

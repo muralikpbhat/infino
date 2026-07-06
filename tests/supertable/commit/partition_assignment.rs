@@ -99,8 +99,14 @@ fn default_strategy_is_single_bucket_hash_observationally_equivalent_to_pre_m15a
         list_entries[0].n_superfiles, 3,
         "after 3 single-superfile commits the part should hold 3 superfiles"
     );
-    // partition_key is the 4-byte LE encoding of bucket 0.
-    assert_eq!(list_entries[0].partition_key, [0u8, 0, 0, 0]);
+    // partition_key is the 4-byte LE encoding of bucket 0. The tag
+    // lives on each superfile entry (stamped by the manifest's
+    // `update()` at commit); parts no longer carry a key of their own.
+    let superfiles = m.get_all_superfiles();
+    assert_eq!(superfiles.len(), 3);
+    for sf in superfiles {
+        assert_eq!(sf.partition_key, [0u8, 0, 0, 0]);
+    }
 }
 
 #[test]
@@ -166,12 +172,19 @@ fn target_superfiles_per_partition_triggers_part_split() {
          got {} entries",
         list_entries.len()
     );
-    assert_eq!(
-        list_entries[0].partition_key, list_entries[1].partition_key,
-        "both entries should share the same partition_key (same partition, split into 2 parts)"
-    );
     let total_superfiles: u64 = list_entries.iter().map(|p| p.n_superfiles).sum();
     assert_eq!(total_superfiles, 3);
+    // All superfiles belong to the same partition (split into 2 parts
+    // by size), so they carry an identical partition_key. The tag lives
+    // on each superfile entry now, not on the part.
+    let superfiles = m.get_all_superfiles();
+    assert_eq!(superfiles.len(), 3);
+    assert!(
+        superfiles
+            .iter()
+            .all(|sf| sf.partition_key == superfiles[0].partition_key),
+        "all superfiles should share the same partition_key (same partition, split into 2 parts)"
+    );
 }
 
 #[test]
@@ -301,10 +314,14 @@ fn time_range_assigns_int64_superfiles_to_bucket_zero() {
         1,
         "single-bucket commit produces one part"
     );
-    // TimeRange partition_key is 8 bytes LE bucket index.
-    assert_eq!(list_entries[0].partition_key.len(), PARTITION_KEY_BYTES);
+    // TimeRange partition_key is 8 bytes LE bucket index. The tag lives
+    // on each superfile entry (stamped by the manifest's `update()`),
+    // not on the part.
+    let superfiles = m.get_all_superfiles();
+    assert_eq!(superfiles.len(), 1);
+    assert_eq!(superfiles[0].partition_key.len(), PARTITION_KEY_BYTES);
     let bucket = u64::from_le_bytes(
-        list_entries[0]
+        superfiles[0]
             .partition_key
             .as_slice()
             .try_into()

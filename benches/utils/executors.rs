@@ -1072,13 +1072,57 @@ pub mod vector {
     ) -> ColdTiming {
         let mut open_samples = Vec::with_capacity(iters);
         let mut search_samples = Vec::with_capacity(iters);
-        for _ in 0..iters {
+        for i in 0..iters {
             let t_open = Instant::now();
             let guard = open_fresh();
             open_samples.push(t_open.elapsed());
+            // On the first cold iteration, capture the per-op object-store
+            // timeline for JUST the search (reset after open, take after the
+            // query) so we can see how many objects/reads a cold query touches
+            // and whether they're serial or parallel. Gated on INFINO_IO_TIMELINE.
+            let capture = i == 0 && infino::storage::io_counters::timeline_enabled();
+            if capture {
+                infino::storage::io_counters::timeline_reset();
+            }
             let t0 = Instant::now();
             let hits = guard.topk_global(column, query, k, nprobe, rerank);
             search_samples.push(t0.elapsed());
+            if capture {
+                let spans = infino::storage::io_counters::timeline_take();
+                let reads = spans.len();
+                let bytes: u64 = spans.iter().map(|s| s.len).sum();
+                let mut objs: Vec<&str> = spans.iter().map(|s| s.uri.as_str()).collect();
+                objs.sort();
+                objs.dedup();
+                let min_start = spans.iter().map(|s| s.start_us).min().unwrap_or(0);
+                let max_end = spans.iter().map(|s| s.end_us).max().unwrap_or(0);
+                let wall_us = max_end.saturating_sub(min_start);
+                let sum_us: u64 = spans.iter().map(|s| s.end_us.saturating_sub(s.start_us)).sum();
+                let conc = if wall_us > 0 { sum_us as f64 / wall_us as f64 } else { 0.0 };
+                eprintln!(
+                    "[cold-search timeline] nprobe={nprobe} rerank={rerank}: {reads} reads over {} distinct objects, {:.1} MiB, wall {:.1}ms, Σdur {:.1}ms, implied concurrency {:.1}x",
+                    objs.len(),
+                    bytes as f64 / (1u64 << 20) as f64,
+                    wall_us as f64 / 1e3,
+                    sum_us as f64 / 1e3,
+                    conc,
+                );
+                // Categorize the distinct objects touched so we can see WHAT a
+                // p=5 query reads (manifest parts vs cell data vs centroids) —
+                // a 5-cell query touching ~640 objects means pruning failed.
+                let kind = |u: &str| -> &'static str {
+                    if u.contains("/current") || u.ends_with("current") { "current" }
+                    else if u.contains("manifest") || u.contains("/parts/") || u.contains("/list") { "manifest-part" }
+                    else if u.contains("vector_index") || u.contains("/cells/") || u.contains("cell_") { "cell-data" }
+                    else { "other" }
+                };
+                let mut hist: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+                for u in &objs { *hist.entry(kind(u)).or_default() += 1; }
+                eprintln!("[cold-search timeline] distinct-object kinds: {:?}", hist);
+                for u in objs.iter().take(6) {
+                    eprintln!("[cold-search timeline]   sample obj: {u}");
+                }
+            }
             black_box(hits);
             drop(guard);
         }

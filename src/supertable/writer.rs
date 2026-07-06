@@ -134,7 +134,6 @@ use crate::{
             commit::get_current_manifest_etag,
             list::PartitionStrategy,
             part::{self as part_mod, PartId},
-            partition::{assign_partition, encode_partition_key},
         },
         query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
         reader_cache::DiskCacheStore,
@@ -1163,7 +1162,7 @@ impl SupertableWriter {
             && let Some(grid) = bootstrap_centroids_from_batch(
                 &buffer,
                 vc.dim,
-                super::handle::GLOBAL_VECTOR_CELL_COUNT,
+                super::handle::global_vector_cell_count(),
             )
         {
             let index = super::manifest::GlobalVectorIndex {
@@ -1805,9 +1804,8 @@ pub(super) fn prepare_superfile_with_uri(
         scalar_stats: shard.scalar_stats,
         fts_summary,
         vector_summary,
-        // Partition assignment populated by the per-shard
-        // `PartitionStrategy` wiring elsewhere; superfiles
-        // emitted here remain unpartitioned (default).
+        // Left empty here; the manifest's `update()` stamps the
+        // partition key at commit time from `partition_hint`.
         partition_key: Vec::new(),
         partition_hint: None,
         subsection_offsets,
@@ -1833,12 +1831,11 @@ pub(super) fn prepare_superfile_with_uri(
 /// docs × 4 superfiles is the dominant cost. Manifest swap +
 /// storage write-through stay serial after the join.
 fn finish_superfile_entry(
-    inner: &SupertableInner,
     entry: Arc<SuperfileEntry>,
     hint: Option<u32>,
 ) -> Result<Arc<SuperfileEntry>, BuildError> {
     let old = entry.as_ref();
-    let mut staged = SuperfileEntry {
+    let staged = SuperfileEntry {
         birth_version: old.birth_version,
         superfile_id: old.superfile_id,
         uri: old.uri,
@@ -1848,15 +1845,13 @@ fn finish_superfile_entry(
         scalar_stats: old.scalar_stats.clone(),
         fts_summary: old.fts_summary.clone(),
         vector_summary: old.vector_summary.clone(),
-        partition_key: old.partition_key.clone(),
+        // Left empty: the manifest's `update()` stamps the partition
+        // key at commit time from `partition_hint`.
+        partition_key: Vec::new(),
         partition_hint: hint.or(old.partition_hint),
         subsection_offsets: old.subsection_offsets.clone(),
         vector_layout: old.vector_layout,
     };
-    let strategy = inner.manifest.load().get_partition_strategy();
-    let pk = assign_partition(&staged, &strategy)
-        .map_err(|e| BuildError::Store(format!("partition assign: {e}")))?;
-    staged.partition_key = encode_partition_key(&pk);
     Ok(Arc::new(staged))
 }
 
@@ -1909,7 +1904,7 @@ fn prepare_user_superfile_batch_in_scope(
             .into_par_iter()
             .zip(hints.into_par_iter())
             .filter_map(|(shard, hint)| match prepare_superfile(inner, shard) {
-                Ok(Some(p)) => Some(finish_superfile_entry(inner, p.entry, hint).map(|entry| {
+                Ok(Some(p)) => Some(finish_superfile_entry(p.entry, hint).map(|entry| {
                     PreparedSuperfile {
                         entry,
                         bytes_for_store: p.bytes_for_store,
@@ -2306,12 +2301,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 let shard = build_one_shard_from_merged(subsection, &ids, &hidden_inner.options)?;
                 let prep =
                     prepare_superfile(&hidden_inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
-                let entry = finish_superfile_entry(&hidden_inner, prep.entry, Some(cell_id))?;
-                let base = running_clusters
-                    .counts
-                    .get(cell_id as usize)
-                    .copied()
-                    .unwrap_or(0);
+                let entry = finish_superfile_entry(prep.entry, Some(cell_id))?;
+                let base = running_clusters.counts.get(cell_id as usize).copied().unwrap_or(0);
                 cell_updates.insert(cell_id, base.saturating_add(added));
                 prepared.push(PreparedSuperfile {
                     entry,
@@ -2435,12 +2426,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             for (cell_id, shard, added) in shards {
                 let prep =
                     prepare_superfile(&hidden_inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
-                let entry = finish_superfile_entry(&hidden_inner, prep.entry, Some(cell_id))?;
-                let base = running_clusters
-                    .counts
-                    .get(cell_id as usize)
-                    .copied()
-                    .unwrap_or(0);
+                let entry = finish_superfile_entry(prep.entry, Some(cell_id))?;
+                let base = running_clusters.counts.get(cell_id as usize).copied().unwrap_or(0);
                 cell_updates.insert(cell_id, base.saturating_add(added));
                 prepared.push(PreparedSuperfile {
                     entry,
@@ -2633,7 +2620,7 @@ fn build_prepared_ivf_from_materialized(
     }
     let shard = build_one_shard_from_materialized(&rows, &inner.options, VectorLayout::Ivf)?;
     let prepared = prepare_superfile(inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
-    let entry = finish_superfile_entry(inner, prepared.entry, Some(partition_hint))?;
+    let entry = finish_superfile_entry(prepared.entry, Some(partition_hint))?;
     Ok(PreparedSuperfile {
         entry,
         bytes_for_store: prepared.bytes_for_store,

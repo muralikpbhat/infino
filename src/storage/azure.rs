@@ -192,9 +192,10 @@ impl StorageProvider for AzureStorageProvider {
 
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let path = self.path(uri)?;
+        let tl = crate::storage::io_counters::timeline_start();
         // etag and bytes are atomically paired in the same response, so
         // no follow-up HEAD is needed.
-        retry::complete_get(uri, || async {
+        let out = retry::complete_get(uri, || async {
             let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
             let meta = ObjectMeta {
                 size: result.meta.size as u64,
@@ -204,18 +205,29 @@ impl StorageProvider for AzureStorageProvider {
             let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
             Ok((bytes, meta))
         })
-        .await
+        .await;
+        if let Ok((b, _)) = &out {
+            crate::storage::io_counters::timeline_record("get", uri, 0, b.len() as u64, tl);
+        }
+        out
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = self.path(uri)?;
-        retry::complete_range(uri, range, |r| async {
+        let off = range.start;
+        let tl = crate::storage::io_counters::timeline_start();
+        let out = retry::complete_range(uri, range, |r| async {
             self.store
                 .get_range(&path, r)
                 .await
                 .map_err(|e| translate(uri, e))
         })
-        .await
+        .await;
+        if let Ok(b) = &out {
+            crate::storage::io_counters::record_get(b.len() as u64);
+            crate::storage::io_counters::timeline_record("get_range", uri, off, b.len() as u64, tl);
+        }
+        out
     }
 
     /// Tail fetch on Azure. Unlike S3, object_store's Azure backend
