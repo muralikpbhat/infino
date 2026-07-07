@@ -401,6 +401,24 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
     }
     drop(w);
     crate::rss::log_rss_breakdown("ingest writer dropped");
+    // A prepared dataset must be query-ready = post-drain: `dataset prepare`
+    // runs no search phase, so the drain that a normal build triggers there
+    // (`drain_vectors_to_cells_sync`) has to happen here, or the reopened
+    // dataset serves from the undrained user superfiles and the hidden cell
+    // index stays empty. Gated to dataset mode so a normal build (which drains
+    // in its search phase) does not drain twice.
+    if crate::dataset::dataset_mode() {
+        eprintln!(
+            "[supertable_ingest] dataset prepare: draining user superfiles into cell superfiles..."
+        );
+        st.drain_vectors_to_cells_sync()
+            .expect("dataset prepare hidden cell drain");
+        if let Some((total, max_per_cell)) = st.hidden_vector_superfile_stats() {
+            eprintln!(
+                "[supertable_ingest] hidden vector index after drain: {total} superfiles, max {max_per_cell} per cell"
+            );
+        }
+    }
     let reader = st.reader();
     let n_superfiles = reader.n_superfiles();
     let total_index_bytes: u64 = reader

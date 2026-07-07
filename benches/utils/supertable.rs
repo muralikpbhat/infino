@@ -1015,6 +1015,16 @@ pub mod vector {
         std::env::var_os("INFINO_BENCH_SKIP_CALIBRATION").is_some()
     }
 
+    /// `INFINO_BENCH_MEASURE_RECALL=1` forces the brute-force ground-truth pass
+    /// even under skip-calibration, so the fixed-config recall@k is reported
+    /// without the full (p, r) target grid. Composes with
+    /// [`skip_calibration`]: skip-cal drops the grid, this restores the single
+    /// recall number. Needs a corpus (build or dataset mode) — inert on the
+    /// existing-prefix path, which has no vectors to grade against.
+    fn measure_recall() -> bool {
+        std::env::var_os("INFINO_BENCH_MEASURE_RECALL").is_some()
+    }
+
     /// Fixed probe count for the `default` row, overridable with
     /// `INFINO_BENCH_VECTOR_NPROBE` (defaults to [`DEFAULT_NPROBE`]).
     fn fixed_nprobe() -> usize {
@@ -1288,9 +1298,11 @@ pub mod vector {
                 // corpus — queries and ground truth come from them instead
                 // of a regeneration. Skip-calibration needs no ground truth
                 // (no recall gate / grid), so the brute-force pass is elided
-                // there; otherwise both query batches share ONE streamed
-                // oracle pass: the pass is I/O-bound over a corpus several
-                // times RAM, so its cost is corpus bytes, not query count.
+                // there — UNLESS `INFINO_BENCH_MEASURE_RECALL` asks for the
+                // fixed-config recall number without the grid. Otherwise both
+                // query batches share ONE streamed oracle pass: the pass is
+                // I/O-bound over a corpus several times RAM, so its cost is
+                // corpus bytes, not query count.
                 let vslice = corpus
                     .vectors()
                     .expect("vector modality prepared a vector corpus")
@@ -1315,7 +1327,7 @@ pub mod vector {
                     Vec<Vec<u32>>,
                     Vec<Vec<u32>>,
                     Option<Vec<Vec<u32>>>,
-                ) = if skip_cal {
+                ) = if skip_cal && !measure_recall() {
                     (Vec::new(), Vec::new(), None)
                 } else {
                     eprintln!(
@@ -1326,13 +1338,20 @@ pub mod vector {
                         q_correct.iter().chain(q_cal.iter()).cloned().collect();
                     let mut gt_all = corpus::ground_truth(vslice, n_docs, &all_queries, TOP_K);
                     let gt_cal = gt_all.split_off(q_correct.len());
-                    let mut allow = RoaringBitmap::new();
-                    for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
-                        allow.insert(i);
-                    }
-                    let filtered_gt =
-                        corpus::filtered_ground_truth(vslice, &allow, &q_correct, TOP_K);
-                    (gt_all, gt_cal, Some(filtered_gt))
+                    // Filtered ground truth is a second corpus pass, consumed
+                    // only by the full-calibration filtered-recall row. Under
+                    // measure-recall-only (skip_cal) there is no grid, so skip
+                    // this extra pass and keep the cost to the single oracle scan.
+                    let filtered_gt = if skip_cal {
+                        None
+                    } else {
+                        let mut allow = RoaringBitmap::new();
+                        for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
+                            allow.insert(i);
+                        }
+                        Some(corpus::filtered_ground_truth(vslice, &allow, &q_correct, TOP_K))
+                    };
+                    (gt_all, gt_cal, filtered_gt)
                 };
                 (q_correct, q_cal, gt_correct, gt_cal, filtered_gt)
             } else {
