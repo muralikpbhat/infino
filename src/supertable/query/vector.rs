@@ -611,12 +611,22 @@ impl SupertableReader {
             segs.dedup();
             segs.len()
         };
-        // Inner-cluster budget: probe the globally-closest
-        // `nprobe × eligible_superfiles` fine IVF centroids across all eligible
-        // superfiles — near superfiles get more of their clusters probed, far
-        // ones fewer or none. `INFINO_INNER_BUDGET` overrides with an absolute
-        // centroid count.
-        let default_budget = nprobe.saturating_mul(n_eligible.max(1)).max(nprobe);
+        // Inner-cluster budget: probe the globally-closest N fine IVF centroids
+        // across all eligible superfiles. The user/pre-drain path uses
+        // N = nprobe × eligible_superfiles. The hidden vector index defaults to a
+        // flat N = nprobe (fewer clusters → faster, lower recall);
+        // `INFINO_HIDDEN_INNER_BUDGET` overrides it (e.g. to nprobe × eligible for
+        // higher recall at higher cost). `INFINO_INNER_BUDGET` overrides both with
+        // an absolute count.
+        let default_budget = if is_hidden_vector_index_table(&manifest.options) {
+            std::env::var("INFINO_HIDDEN_INNER_BUDGET")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .map(|b| b.max(1))
+                .unwrap_or(nprobe.max(1))
+        } else {
+            nprobe.saturating_mul(n_eligible.max(1)).max(nprobe)
+        };
         let budget = std::env::var("INFINO_INNER_BUDGET")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
