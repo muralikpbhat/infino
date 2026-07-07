@@ -66,7 +66,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     future::Future,
     sync::Arc,
     time::Instant,
@@ -641,6 +641,52 @@ impl SupertableReader {
         let mut per_seg: HashMap<usize, Vec<u32>> = HashMap::new();
         for (si, c, _) in scored {
             per_seg.entry(si).or_default().push(c);
+        }
+
+        // Probe-distribution diagnostic (opt-in, `INFINO_PROBE_DIST_DEBUG`): which
+        // cells and clusters the selected probe budget lands in. Each drained
+        // fragment carries its cell in `partition_hint`, so grouping the probed
+        // clusters by cell shows whether the budget concentrates into one cell
+        // (boundary neighbors in adjacent cells go unprobed) or spans several.
+        // The env value caps how many queries print (default 32) so criterion's
+        // repeat iterations don't flood. Off by default — one env read per query.
+        // Only the hidden vector index — skip the pre-drain user-superfile path
+        // (untagged cells, `nprobe × superfiles` budget) so its queries neither
+        // print nor consume the emission cap.
+        if is_hidden_vector_index_table(&manifest.options) {
+            if let Ok(v) = std::env::var("INFINO_PROBE_DIST_DEBUG") {
+                use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+                static EMITTED: AtomicUsize = AtomicUsize::new(0);
+                let cap = v.parse::<usize>().ok().filter(|&n| n > 0).unwrap_or(32);
+                let q = EMITTED.fetch_add(1, AtomicOrdering::Relaxed);
+                if q < cap {
+                    let total_probes: usize = per_seg.values().map(|v| v.len()).sum();
+                    // cell -> [(fragment si, sorted cluster ids)], cells sorted.
+                    let mut by_cell: BTreeMap<i64, Vec<(usize, Vec<u32>)>> = BTreeMap::new();
+                    for (&si, clusters) in per_seg.iter() {
+                        let cell = superfiles[si].partition_hint.map(i64::from).unwrap_or(-1);
+                        let mut cs = clusters.clone();
+                        cs.sort_unstable();
+                        by_cell.entry(cell).or_default().push((si, cs));
+                    }
+                    let mut cells_str = String::new();
+                    for (cell, frags) in by_cell.iter() {
+                        cells_str.push_str(&format!(" cell={cell}{{"));
+                        for (fi, (si, cs)) in frags.iter().enumerate() {
+                            if fi > 0 {
+                                cells_str.push(' ');
+                            }
+                            cells_str.push_str(&format!("frag{si}:{cs:?}"));
+                        }
+                        cells_str.push('}');
+                    }
+                    eprintln!(
+                        "[probe-dist] q={q} budget={budget} probes={total_probes} \
+                     distinct_cells={} nprobe={nprobe} eligible={n_eligible} |{cells_str}",
+                        by_cell.len()
+                    );
+                }
+            }
         }
 
         // Build fan-out units: selected superfiles probe their chosen
