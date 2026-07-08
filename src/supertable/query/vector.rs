@@ -597,6 +597,44 @@ impl SupertableReader {
             }
         }
 
+        // Coverage cap (hidden index only): honor `INFINO_CELL_NPROBE_MAX` as the
+        // number of nearest cells to probe. Rank cells by their closest cluster,
+        // keep the top-N, and drop clusters in farther cells BEFORE the
+        // inner-cluster budget selects within the survivors — so coverage (how
+        // many cells) and depth (clusters within) are independent levers.
+        // Unset / `-1` / `<= 0` = unbounded (all cells), today's behavior. Only
+        // the hidden index has cells (`partition_hint`); the user path has none
+        // and is never capped.
+        if is_hidden_vector_index_table(&manifest.options) {
+            let cell_cap = std::env::var("INFINO_CELL_NPROBE_MAX")
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .filter(|&n| n > 0)
+                .map(|n| n as usize);
+            if let Some(cap) = cell_cap {
+                let cell_of = |si: usize| superfiles[si].partition_hint.map(i64::from).unwrap_or(-1);
+                let mut best_by_cell: HashMap<i64, f32> = HashMap::new();
+                for &(si, _, score) in &scored {
+                    best_by_cell
+                        .entry(cell_of(si))
+                        .and_modify(|b| {
+                            if score < *b {
+                                *b = score;
+                            }
+                        })
+                        .or_insert(score);
+                }
+                if best_by_cell.len() > cap {
+                    let mut cells: Vec<(i64, f32)> = best_by_cell.into_iter().collect();
+                    cells.select_nth_unstable_by(cap, |a, b| {
+                        a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)
+                    });
+                    let keep: HashSet<i64> = cells[..cap].iter().map(|&(c, _)| c).collect();
+                    scored.retain(|&(si, _, _)| keep.contains(&cell_of(si)));
+                }
+            }
+        }
+
         // Global probe budget: the closest `nprobe × (eligible superfiles)`
         // clusters — the same total probe count as the old per-superfile
         // `nprobe`, but selected globally, so near superfiles get more
