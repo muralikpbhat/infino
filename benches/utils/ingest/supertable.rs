@@ -80,6 +80,15 @@ const GIB_BYTES: u64 = 1u64 << 30;
 const BENCH_METRIC: Metric = Metric::Cosine;
 /// Rerank residual codec for the bench vector index.
 const BENCH_RERANK: RerankCodec = RerankCodec::Sq8Residual;
+/// Bench rerank codec, `INFINO_RERANK_FP32=1` forcing exact fp32 rerank to
+/// isolate Sq8 quantization loss from routing/coverage/cell-count effects.
+fn bench_rerank() -> RerankCodec {
+    if std::env::var_os("INFINO_RERANK_FP32").is_some() {
+        RerankCodec::Fp32
+    } else {
+        BENCH_RERANK
+    }
+}
 /// Writer auto-flush threshold (MiB) per superfile roll.
 const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Producer memory budget in GiB — steers the attached disk cache's
@@ -202,7 +211,15 @@ pub fn options_for(
         return opts;
     }
     let n_cent_total = corpus::n_cent(n_docs());
-    let n_cent_per_superfile = (n_cent_total / n_commits()).max(1);
+    // `INFINO_N_CENT` overrides the per-superfile IVF cluster count (index only;
+    // the corpus's planted centers still use `n_cent_total`, so GT/queries and
+    // the dataset sidecar are unchanged — only the index clustering granularity
+    // varies). Lets a sweep drive docs-per-cluster down for higher recall.
+    let n_cent_per_superfile = std::env::var("INFINO_N_CENT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or((n_cent_total / n_commits()).max(1));
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(n_writers().max(1))
@@ -225,7 +242,7 @@ pub fn options_for(
             n_cent: n_cent_per_superfile,
             rot_seed: ROT_SEED,
             metric: BENCH_METRIC,
-            rerank_codec: BENCH_RERANK,
+            rerank_codec: bench_rerank(),
         }]
     } else {
         vec![]
@@ -255,7 +272,7 @@ pub fn current_knobs(modality: Modality) -> crate::dataset::Knobs {
         text_seed: CORPUS_TEXT_SEED,
         rot_seed: ROT_SEED,
         metric: format!("{BENCH_METRIC:?}"),
-        rerank_codec: format!("{BENCH_RERANK:?}"),
+        rerank_codec: format!("{:?}", bench_rerank()),
         modality: format!("{modality:?}"),
     }
 }

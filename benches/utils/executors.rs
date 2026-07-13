@@ -817,6 +817,58 @@ pub mod vector {
         sum / queries.len() as f32
     }
 
+    /// Miss diagnostic (opt-in): for each true top-`k` neighbor the search
+    /// missed, report where it landed in a large top-`k_big` result. Run under
+    /// a max-all config (all cells/clusters, rerank≈all) so the candidate set is
+    /// the whole index — then a missed neighbor is either FATE2 (present at some
+    /// rank `k..k_big` → indexed but Sq8 mis-ranks it below the true top-k) or
+    /// FATE1 (absent from top-`k_big` → not indexed / dropped at drain, or an
+    /// extreme mis-rank). Separates a build/drain bug from a codec-precision
+    /// ceiling without touching the search internals.
+    pub fn diag_misses<R: VectorRead>(
+        reader: &R,
+        column: &str,
+        queries: &[Vec<f32>],
+        truths: &[Vec<u32>],
+        k: usize,
+        k_big: usize,
+        nprobe: usize,
+        rerank: usize,
+        log_prefix: &str,
+    ) {
+        let (mut miss, mut fate1, mut fate2) = (0usize, 0usize, 0usize);
+        for (qi, (q, t)) in queries.iter().zip(truths).enumerate() {
+            let big: Vec<u32> = reader
+                .topk_global(column, q, k_big, nprobe, rerank)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            for (gi, &d) in t.iter().take(k).enumerate() {
+                if big.iter().take(k).any(|&x| x == d) {
+                    continue; // not a miss — the search already returned it in top-k
+                }
+                miss += 1;
+                match big.iter().position(|&x| x == d) {
+                    Some(pos) => {
+                        fate2 += 1;
+                        eprintln!(
+                            "[miss-diag] {log_prefix} q{qi} gt#{gi} id={d}: search_rank={pos} -> FATE2 (indexed, Sq8 mis-rank)"
+                        );
+                    }
+                    None => {
+                        fate1 += 1;
+                        eprintln!(
+                            "[miss-diag] {log_prefix} q{qi} gt#{gi} id={d}: ABSENT from top-{k_big} -> FATE1 (unindexed / extreme mis-rank)"
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[miss-diag] {log_prefix} SUMMARY misses={miss} fate2_misranked={fate2} fate1_absent={fate1}"
+        );
+    }
+
     /// Largest doc count that still calibrates with the exhaustive
     /// 54-point grid sweep per target. Each grid point costs one full
     /// `mean_recall` battery (100 searches), so the sweep is fine on
@@ -1296,6 +1348,22 @@ pub mod vector {
                     "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {DEFAULT_CONFIG_RECALL_FLOOR:.2})",
                 );
                 default_recall = Some(default);
+                // Opt-in miss diagnostic: run under a max-all config so the
+                // candidate set ≈ whole index, then classify each missed true
+                // neighbor as FATE1 (absent) vs FATE2 (present but mis-ranked).
+                if std::env::var_os("INFINO_MISS_DIAG").is_some() {
+                    diag_misses(
+                        warm_reader,
+                        column,
+                        q_correct,
+                        gt_correct,
+                        k,
+                        1000,
+                        default_nprobe,
+                        default_rerank,
+                        log_prefix,
+                    );
+                }
             }
         } else {
             eprintln!(

@@ -60,6 +60,18 @@ const SUB_HEADER_SIZE: usize = format::vec::SUB_HEADER_SIZE;
 /// survivors are re-scored with the more expensive residual leg.
 const SQ8_RESIDUAL_REFINE_MULT: usize = 2;
 
+/// `SQ8_RESIDUAL_REFINE_MULT`, overridable via `INFINO_REFINE_MULT`. Widening
+/// the refine gate distinguishes a missed neighbor dropped at the `2·k`
+/// truncation (recall rises) from one the residual leg genuinely mis-ranks
+/// (recall flat).
+fn sq8_residual_refine_mult() -> usize {
+    std::env::var("INFINO_REFINE_MULT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&m| m > 0)
+        .unwrap_or(SQ8_RESIDUAL_REFINE_MULT)
+}
+
 /// JSON-deserialized form of one vector-index entry in the legacy `inf.vec.columns` metadata. The KV
 /// value is a JSON array of these in declaration order.
 #[derive(Debug, Clone, Deserialize)]
@@ -2951,7 +2963,7 @@ async fn rerank_candidates_from_blocks(
                     scored
                         .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
                     let final_refine = k
-                        .saturating_mul(SQ8_RESIDUAL_REFINE_MULT)
+                        .saturating_mul(sq8_residual_refine_mult())
                         .max(k)
                         .min(scored.len());
                     scored.truncate(final_refine);
@@ -3120,7 +3132,7 @@ fn residual_refine_from_blocks<'a>(
 ) -> Vec<(u32, f32)> {
     scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     let final_refine = k
-        .saturating_mul(SQ8_RESIDUAL_REFINE_MULT)
+        .saturating_mul(sq8_residual_refine_mult())
         .max(k)
         .min(scored.len());
     scored.truncate(final_refine);

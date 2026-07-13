@@ -105,6 +105,12 @@ const N_CENT_SMALL: usize = 64;
 const SQ8_CODE_MAX: f32 = 255.0;
 
 fn n_cent_row_count_cap(n_docs: usize) -> usize {
+    // Explicit `INFINO_N_CENT` override bypasses the doc-count band cap — the
+    // caller asked for a specific cluster count, so only `.min(n_docs)` bounds
+    // it (a superfile can't have more clusters than rows).
+    if std::env::var_os("INFINO_N_CENT").is_some() {
+        return usize::MAX;
+    }
     if n_docs >= N_CENT_LARGE_DOC_THRESHOLD {
         N_CENT_LARGE
     } else if n_docs >= N_CENT_MEDIUM_DOC_THRESHOLD {

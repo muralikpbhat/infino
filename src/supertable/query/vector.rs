@@ -635,6 +635,39 @@ impl SupertableReader {
             }
         }
 
+        // Per-cell inner budget (hidden index): `INFINO_PER_CELL_BUDGET=K` probes
+        // the K closest clusters WITHIN EACH surviving cell, instead of the global
+        // top-N below. So each qualified cell (after the `CELL_NPROBE_MAX` coverage
+        // cap) is guaranteed K-deep — a boundary neighbor's cell can't be starved
+        // by the nearest cell hogging a single global budget. Total probes =
+        // (cells kept) × K. Unset = global budget (the block below).
+        let per_cell_budget = if is_hidden_vector_index_table(&manifest.options) {
+            std::env::var("INFINO_PER_CELL_BUDGET")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&k| k > 0)
+        } else {
+            None
+        };
+        if let Some(k) = per_cell_budget {
+            let cell_of = |si: usize| superfiles[si].partition_hint.map(i64::from).unwrap_or(-1);
+            let mut by_cell: HashMap<i64, Vec<(usize, u32, f32)>> = HashMap::new();
+            for &t in &scored {
+                by_cell.entry(cell_of(t.0)).or_default().push(t);
+            }
+            let mut kept: Vec<(usize, u32, f32)> = Vec::new();
+            for (_, mut v) in by_cell {
+                if v.len() > k {
+                    v.select_nth_unstable_by(k, |a, b| {
+                        a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
+                    });
+                    v.truncate(k);
+                }
+                kept.extend(v);
+            }
+            scored = kept;
+        }
+
         // Global probe budget: the closest `nprobe × (eligible superfiles)`
         // clusters — the same total probe count as the old per-superfile
         // `nprobe`, but selected globally, so near superfiles get more
@@ -670,7 +703,7 @@ impl SupertableReader {
             .and_then(|s| s.parse::<usize>().ok())
             .map(|b| b.max(1))
             .unwrap_or(default_budget);
-        if scored.len() > budget {
+        if per_cell_budget.is_none() && scored.len() > budget {
             scored.select_nth_unstable_by(budget, |a, b| {
                 a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
             });

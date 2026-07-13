@@ -849,6 +849,34 @@ impl Supertable {
         if total == 0 {
             return Some((0, 0));
         }
+        // Opt-in structure dump: per-superfile n_docs + n_cent (from the
+        // manifest's vector_summary), and the aggregate docs-per-leaf-cluster.
+        if std::env::var_os("INFINO_DUMP_CELL_STRUCTURE").is_some() {
+            let mut tot_docs: u64 = 0;
+            let mut tot_cent: usize = 0;
+            for (i, entry) in flat_superfiles.iter().enumerate() {
+                let ncent: usize = entry
+                    .vector_summary
+                    .values()
+                    .map(|vs| vs.clusters.n_cent as usize)
+                    .sum();
+                tot_docs += entry.n_docs;
+                tot_cent += ncent;
+                if i < 8 {
+                    eprintln!(
+                        "[cell-struct] sf#{i} cell={:?} n_docs={} n_cent={} docs/cluster={}",
+                        entry.partition_hint,
+                        entry.n_docs,
+                        ncent,
+                        entry.n_docs as usize / ncent.max(1),
+                    );
+                }
+            }
+            eprintln!(
+                "[cell-struct] SUMMARY superfiles={total} total_docs={tot_docs} total_leaf_clusters={tot_cent} avg_docs_per_cluster={}",
+                tot_docs as usize / tot_cent.max(1),
+            );
+        }
         let max_per_cell = by_cell.values().copied().max().unwrap_or(0);
         Some((total, max_per_cell))
     }
