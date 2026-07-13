@@ -118,42 +118,82 @@ test_visible! {
 const USER_FINE_RUNS_PER_FRAGMENT: usize = 8;
 }
 
-type FineCandidate = (usize, u32, f32, u64);
-
-/// Rank fine centroids globally across selected coarse cells, keep a bounded
-/// prefix (including exact score ties), then refill only when the retained
-/// runs contain too few rows to produce top-k.
-fn select_bounded_fine_candidates(
-    mut fine: Vec<FineCandidate>,
-    fine_nprobe: usize,
-    postings_target: u64,
+/// Build the fine-cluster probe set, keeping up to `keep_per_fragment` of each
+/// `(cell, fragment)`'s nearest runs, then refilling globally (best score
+/// first) toward `gated_target` postings. The per-fragment floor guarantees
+/// every superfile of a selected cell contributes to the shortlist: a cell may
+/// span multiple fragments (a base shard plus incrementally drained deltas),
+/// each an independent IVF, so a small fragment is still probed rather than
+/// crowded out by a larger sibling in the same cell. Candidates without a cell
+/// go to `scored` for the flat (non-cell) path.
+fn gate_fine_candidates_by_fragment(
+    candidates: Vec<(usize, u32, f32, Option<u32>, u64)>,
+    selected: &HashSet<u32>,
+    selected_ordered: &[u32],
+    keep_per_fragment: usize,
+    gated_target: u64,
+    candidate_counts: &HashMap<(usize, u32), u64>,
+    scored: &mut Vec<(usize, u32, f32)>,
 ) -> Vec<(usize, u32, f32)> {
-    fine.sort_unstable_by(|a, b| {
-        a.2.partial_cmp(&b.2)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
-    });
-    let mut keep = fine_nprobe.max(1).min(fine.len());
-    if keep < fine.len() {
-        let cutoff_score = fine[keep - 1].2;
-        while keep < fine.len() && fine[keep].2.total_cmp(&cutoff_score) == Ordering::Equal {
-            keep += 1;
+    let mut fine_by_fragment: HashMap<(u32, usize), Vec<(u32, f32, u64)>> = HashMap::new();
+    for (si, cluster, score, cell, count) in candidates {
+        match cell {
+            Some(cell) if selected.contains(&cell) => fine_by_fragment
+                .entry((cell, si))
+                .or_default()
+                .push((cluster, score, count)),
+            Some(_) => {}
+            None => scored.push((si, cluster, score)),
         }
     }
-    let mut remaining = fine.split_off(keep);
-    let mut postings: u64 = fine.iter().map(|candidate| candidate.3).sum();
-    if postings < postings_target {
-        for candidate in remaining.drain(..) {
-            postings += candidate.3;
-            fine.push(candidate);
-            if postings >= postings_target {
+    let mut gated = Vec::new();
+    let mut remaining = Vec::new();
+    for &cell in selected_ordered {
+        let mut fragment_ids: Vec<usize> = fine_by_fragment
+            .keys()
+            .filter_map(|(candidate_cell, si)| (*candidate_cell == cell).then_some(*si))
+            .collect();
+        fragment_ids.sort_unstable();
+        for si in fragment_ids {
+            let Some(mut fine) = fine_by_fragment.remove(&(cell, si)) else {
+                continue;
+            };
+            fine.sort_unstable_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let keep = keep_per_fragment.max(1).min(fine.len());
+            let tail = fine.split_off(keep);
+            gated.extend(
+                fine.into_iter()
+                    .map(|(cluster, score, _)| (si, cluster, score)),
+            );
+            remaining.extend(
+                tail.into_iter()
+                    .map(|(cluster, score, count)| (si, cluster, score, count)),
+            );
+        }
+    }
+    let mut postings: u64 = gated
+        .iter()
+        .map(|(si, cluster, _)| candidate_counts.get(&(*si, *cluster)).copied().unwrap_or(0))
+        .sum();
+    if postings < gated_target {
+        remaining.sort_unstable_by(|a, b| {
+            a.2.partial_cmp(&b.2)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
+        });
+        for (si, cluster, score, count) in remaining {
+            gated.push((si, cluster, score));
+            postings += count;
+            if postings >= gated_target {
                 break;
             }
         }
     }
-    fine.into_iter()
-        .map(|(superfile, cluster, score, _)| (superfile, cluster, score))
-        .collect()
+    gated
 }
 
 /// An optional text-predicate filter for vector kNN search. When
@@ -766,21 +806,25 @@ impl SupertableReader {
                     while cutoff < max_cells && ranked_hidden[cutoff].1 <= threshold {
                         cutoff += 1;
                     }
-                    let selected_cells: HashSet<u32> = ranked_hidden[..cutoff]
+                    let selected_cells_ordered: Vec<u32> = ranked_hidden[..cutoff]
                         .iter()
                         .map(|(cell, _)| *cell)
                         .collect();
-                    let mut fine = Vec::new();
-                    for (si, cluster, score, cell, count) in candidates {
-                        match cell {
-                            Some(cell) if selected_cells.contains(&cell) => {
-                                fine.push((si, cluster, score, count));
-                            }
-                            Some(_) => {}
-                            None => scored.push((si, cluster, score)),
-                        }
-                    }
-                    gated = select_bounded_fine_candidates(fine, routing.fine_nprobe, gated_target);
+                    let selected_cells: HashSet<u32> =
+                        selected_cells_ordered.iter().copied().collect();
+                    // Probe each fragment of the selected cell(s): after a
+                    // compaction a cell can hold a large base shard beside a
+                    // small drained-delta shard, and the delta's rows only reach
+                    // the shortlist if its fragment keeps a share of the budget.
+                    gated = gate_fine_candidates_by_fragment(
+                        candidates,
+                        &selected_cells,
+                        &selected_cells_ordered,
+                        routing.fine_nprobe,
+                        gated_target,
+                        &candidate_counts,
+                        &mut scored,
+                    );
                 } else {
                     let mut cutoff = nprobe.max(1).min(ranked.len());
                     let mut covered: u64 = ranked[..cutoff]
@@ -793,68 +837,15 @@ impl SupertableReader {
                     }
                     let selected_cells = &ranked[..cutoff];
                     let selected: HashSet<u32> = selected_cells.iter().copied().collect();
-                    let mut fine_by_fragment: HashMap<(u32, usize), Vec<(u32, f32, u64)>> =
-                        HashMap::new();
-                    for (si, cluster, score, cell, count) in candidates {
-                        match cell {
-                            Some(cell) if selected.contains(&cell) => fine_by_fragment
-                                .entry((cell, si))
-                                .or_default()
-                                .push((cluster, score, count)),
-                            Some(_) => {}
-                            None => scored.push((si, cluster, score)),
-                        }
-                    }
-                    let mut remaining = Vec::new();
-                    for &cell in selected_cells {
-                        let mut fragment_ids: Vec<usize> = fine_by_fragment
-                            .keys()
-                            .filter_map(|(candidate_cell, si)| {
-                                (*candidate_cell == cell).then_some(*si)
-                            })
-                            .collect();
-                        fragment_ids.sort_unstable();
-                        for si in fragment_ids {
-                            let Some(mut fine) = fine_by_fragment.remove(&(cell, si)) else {
-                                continue;
-                            };
-                            fine.sort_unstable_by(|a, b| {
-                                a.1.partial_cmp(&b.1)
-                                    .unwrap_or(Ordering::Equal)
-                                    .then_with(|| a.0.cmp(&b.0))
-                            });
-                            let keep = USER_FINE_RUNS_PER_FRAGMENT.min(fine.len());
-                            let tail = fine.split_off(keep);
-                            gated.extend(
-                                fine.into_iter()
-                                    .map(|(cluster, score, _)| (si, cluster, score)),
-                            );
-                            remaining.extend(
-                                tail.into_iter()
-                                    .map(|(cluster, score, count)| (si, cluster, score, count)),
-                            );
-                        }
-                    }
-                    let mut postings: u64 = gated
-                        .iter()
-                        .map(|(si, cluster, _)| {
-                            candidate_counts.get(&(*si, *cluster)).copied().unwrap_or(0)
-                        })
-                        .sum();
-                    if postings < gated_target {
-                        remaining.sort_unstable_by(|a, b| {
-                            a.2.partial_cmp(&b.2)
-                                .unwrap_or(Ordering::Equal)
-                                .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
-                        });
-                        for (si, cluster, score, count) in remaining {
-                            gated.push((si, cluster, score));
-                            postings += count;
-                            if postings >= gated_target {
-                                break;
-                            }
-                        }
-                    }
+                    gated = gate_fine_candidates_by_fragment(
+                        candidates,
+                        &selected,
+                        selected_cells,
+                        USER_FINE_RUNS_PER_FRAGMENT,
+                        gated_target,
+                        &candidate_counts,
+                        &mut scored,
+                    );
                 }
             }
             _ => {
@@ -2062,15 +2053,18 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
 
     use arrow::array::Array;
     use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        VectorFilter, VectorSearchOptions, is_hidden_vector_manifest,
-        select_bounded_fine_candidates,
+        VectorFilter, VectorSearchOptions, gate_fine_candidates_by_fragment,
+        is_hidden_vector_manifest,
     };
     use crate::{
         superfile::{
@@ -2084,9 +2078,6 @@ mod tests {
         },
         test_helpers::default_tokenizer as tok,
     };
-
-    const TEST_FINE_NPROBE: usize = 2;
-    const TEST_FINE_POSTINGS_TARGET: u64 = 10;
 
     /// Drive an async future to completion on a throwaway current-thread
     /// runtime. Used only for the single-superfile `SuperfileReader`
@@ -2119,22 +2110,44 @@ mod tests {
         assert!(is_hidden_vector_manifest(&manifest));
     }
 
+    /// A small fragment sharing a cell with a much larger one must still be
+    /// probed: its fine runs score worse and would lose every slot under a
+    /// single global cap, so the per-fragment keep has to floor it in. Guards
+    /// the post-compaction case where a cell holds a base shard plus a small
+    /// drained-delta shard.
     #[test]
-    fn bounded_fine_selection_keeps_ties_and_refills_postings() {
-        let selected = select_bounded_fine_candidates(
-            vec![
-                (3, 30, 0.3, 6),
-                (1, 10, 0.1, 2),
-                (2, 20, 0.2, 1),
-                (4, 40, 0.2, 1),
-            ],
-            TEST_FINE_NPROBE,
-            TEST_FINE_POSTINGS_TARGET,
+    fn per_fragment_keep_probes_small_fragment_in_shared_cell() {
+        // Cell 0, fragment 0 (large base): three near clusters.
+        // Cell 0, fragment 1 (small delta): one farther cluster.
+        let candidates = vec![
+            (0usize, 10u32, 0.10f32, Some(0u32), 5u64),
+            (0, 11, 0.11, Some(0), 5),
+            (0, 12, 0.12, Some(0), 5),
+            (1, 20, 0.30, Some(0), 5),
+        ];
+        let selected: HashSet<u32> = [0].into_iter().collect();
+        let selected_ordered = [0u32];
+        let candidate_counts: HashMap<(usize, u32), u64> = candidates
+            .iter()
+            .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
+            .collect();
+        let mut scored = Vec::new();
+        let gated = gate_fine_candidates_by_fragment(
+            candidates,
+            &selected,
+            &selected_ordered,
+            2, // keep_per_fragment
+            1, // gated_target: tiny so the global refill can't mask the floor
+            &candidate_counts,
+            &mut scored,
         );
-        assert_eq!(
-            selected,
-            vec![(1, 10, 0.1), (2, 20, 0.2), (4, 40, 0.2), (3, 30, 0.3)]
+        // The small fragment (si=1) is probed despite its worse score.
+        assert!(
+            gated.iter().any(|(si, _, _)| *si == 1),
+            "small fragment starved from the probe set: {gated:?}"
         );
+        // The large fragment keeps exactly keep_per_fragment=2 of its 3 runs.
+        assert_eq!(gated.iter().filter(|(si, _, _)| *si == 0).count(), 2);
     }
 
     fn fixed_list_f32(dim: usize) -> DataType {
