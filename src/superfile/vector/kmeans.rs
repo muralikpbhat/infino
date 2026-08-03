@@ -31,7 +31,7 @@ use rayon::prelude::*;
 
 use crate::superfile::vector::distance::{
     Metric, add_f32_to_f64_acc, f64_acc_mean_into_f32, nearest_centroid_transposed,
-    transpose_centroids_cluster_major,
+    nearest_k_centroids_transposed, transpose_centroids_cluster_major,
 };
 
 /// Offset added to a column's `rot_seed` to seed k-means. Keeps the
@@ -381,38 +381,59 @@ fn assign_coarse(
     let m = (k as f64).sqrt().ceil() as usize;
     let (supers, super_of) =
         kmeans_with_assignments(centroids, dim, m, COARSE_SUPER_ITERS, COARSE_SUPER_SEED);
+    // Group cell ids by super, and build a per-super block-transposed centroid
+    // cache so the within-super refine uses the SAME SIMD scan as the exact path
+    // — v1's scalar per-candidate refine cancelled the fewer-distances win.
     let mut cells_of_super: Vec<Vec<u32>> = vec![Vec::new(); m];
     for (cid, &s) in super_of.iter().enumerate() {
         cells_of_super[s as usize].push(cid as u32);
     }
+    let super_blocks: Vec<Vec<f32>> = cells_of_super
+        .iter()
+        .map(|cids| {
+            let mut gathered = vec![0f32; cids.len() * dim];
+            for (li, &cid) in cids.iter().enumerate() {
+                gathered[li * dim..(li + 1) * dim]
+                    .copy_from_slice(&centroids[cid as usize * dim..(cid as usize + 1) * dim]);
+            }
+            transpose_centroids_cluster_major(&gathered, cids.len(), dim)
+        })
+        .collect();
+    let supers_t = transpose_centroids_cluster_major(&supers, m, dim);
     let nprobe = COARSE_SUPER_NPROBE.min(m);
-    // Built once; used only for the rare all-empty-super fallback below.
-    let transposed = transpose_centroids_cluster_major(centroids, k, dim);
+    // Fallback cache for the rare row whose probed supers are all empty.
+    let all_t = transpose_centroids_cluster_major(centroids, k, dim);
     assignments
         .par_iter_mut()
         .enumerate()
         .for_each(|(d, slot)| {
             let v = &vectors[d * dim..(d + 1) * dim];
-            // top-`nprobe` nearest super-centroids (m is small — partial select).
-            let mut sd: Vec<(f32, u32)> = (0..m)
-                .map(|s| (l2_sq(v, &supers[s * dim..(s + 1) * dim], dim), s as u32))
-                .collect();
-            sd.select_nth_unstable_by(nprobe - 1, |a, b| a.0.total_cmp(&b.0));
-            // exact nearest centroid among the candidate cells under those supers.
+            // top-`nprobe` super-centroids via the SIMD block-transposed kernel.
+            let top =
+                nearest_k_centroids_transposed(Metric::L2Sq, v, &supers_t, m, dim, None, nprobe);
+            // Exact nearest centroid among the cells under those supers; each
+            // super's cells are a contiguous transposed block, so this is SIMD.
             let mut best_cid = u32::MAX;
             let mut best_d2 = f32::INFINITY;
-            for &(_, s) in &sd[..nprobe] {
-                for &cid in &cells_of_super[s as usize] {
-                    let c = &centroids[cid as usize * dim..(cid as usize + 1) * dim];
-                    let d2 = l2_sq(v, c, dim);
-                    if d2 < best_d2 {
-                        best_d2 = d2;
-                        best_cid = cid;
-                    }
+            for &(s, _) in &top {
+                let cids = &cells_of_super[s as usize];
+                if cids.is_empty() {
+                    continue;
+                }
+                let (li, d2) = nearest_centroid_transposed(
+                    Metric::L2Sq,
+                    v,
+                    &super_blocks[s as usize],
+                    cids.len(),
+                    dim,
+                );
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best_cid = cids[li as usize];
                 }
             }
             *slot = if best_cid == u32::MAX {
-                nearest_centroid_transposed(Metric::L2Sq, v, &transposed, k, dim).0
+                nearest_centroid_transposed(Metric::L2Sq, v, &all_t, k, dim).0
             } else {
                 best_cid
             };
@@ -556,6 +577,47 @@ mod tests {
     #[should_panic(expected = "not multiple of dim")]
     fn panics_on_unaligned_input() {
         kmeans(&[1.0; 7], 8, 1, 5, 0);
+    }
+
+    #[test]
+    #[ignore] // timing spike — run with `--release ... -- --ignored --nocapture`
+    fn bench_coarse_vs_exact_assign_at_scale() {
+        use std::time::Instant;
+        let dim = 1024;
+        let k = 3587; // az1's grid at 250M
+        let n = 500_000; // per-row cost is linear → extrapolate to the 4.7M drain batch
+        let mut rng = StdRng::seed_from_u64(1);
+        let centroids: Vec<f32> = (0..k * dim).map(|_| rng.random::<f32>()).collect();
+        let mut vectors = vec![0f32; n * dim];
+        for d in 0..n {
+            let c = rng.random_range(0..k);
+            for j in 0..dim {
+                vectors[d * dim + j] = centroids[c * dim + j] + (rng.random::<f32>() - 0.5) * 0.05;
+            }
+        }
+        // coarse (assign_to_centroids uses the coarse path since k > 1024)
+        let mut a_coarse = vec![0u32; n];
+        let t = Instant::now();
+        assign_to_centroids(&vectors, &centroids, dim, k, &mut a_coarse);
+        let coarse = t.elapsed().as_secs_f64();
+        // exact (inline the pre-coarse path)
+        let transposed = transpose_centroids_cluster_major(&centroids, k, dim);
+        let mut a_exact = vec![0u32; n];
+        let t = Instant::now();
+        a_exact.par_iter_mut().enumerate().for_each(|(d, slot)| {
+            let v = &vectors[d * dim..(d + 1) * dim];
+            *slot = nearest_centroid_transposed(Metric::L2Sq, v, &transposed, k, dim).0;
+        });
+        let exact = t.elapsed().as_secs_f64();
+        let matches = (0..n).filter(|&d| a_coarse[d] == a_exact[d]).count();
+        eprintln!(
+            "ASSIGN n={n} k={k} dim={dim}: exact={exact:.2}s coarse={coarse:.2}s \
+             speedup={:.1}x match={:.2}% (extrapolated to 4.7M batch: exact~{:.0}s coarse~{:.0}s)",
+            exact / coarse,
+            matches as f64 / n as f64 * 100.0,
+            exact * 4_745_597.0 / n as f64,
+            coarse * 4_745_597.0 / n as f64,
+        );
     }
 
     #[test]
