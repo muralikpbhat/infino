@@ -5133,7 +5133,15 @@ fn drain_cell_vector_config(cfg: &VectorConfig, n_rows: usize) -> (VectorConfig,
     let rerank_bytes = rerank_codec.per_vector_bytes(dim);
     let row_stride =
         rabitq_bytes + DOC_ID_BYTES + rerank_bytes + STABLE_ID_BYTES + mem::size_of::<f32>();
-    let rows_per_run = (DRAIN_FINE_RUN_TARGET_BYTES / row_stride.max(1)).max(1);
+    // Experimental cluster-size sweep knob: override the fine-run byte target
+    // at drain time to sweep vectors-per-cluster without editing the const
+    // (smaller target ⇒ smaller fine clusters ⇒ tighter reads / more centroids).
+    let target_bytes = std::env::var("INFINO_DRAIN_FINE_RUN_TARGET_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&b| b > 0)
+        .unwrap_or(DRAIN_FINE_RUN_TARGET_BYTES);
+    let rows_per_run = (target_bytes / row_stride.max(1)).max(1);
     let n_cent = n_rows.div_ceil(rows_per_run).clamp(1, n_rows);
     let cell_cfg = VectorConfig {
         rerank_codec,
