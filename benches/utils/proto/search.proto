@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: Apache-2.0
+// Minimal vector-search service for the loopback throughput bench server
+// (benches/utils/bin/grpcserver.rs). Not part of the engine's public surface.
+syntax = "proto3";
+package infsearch;
+
+service Search {
+  rpc VectorSearch (SearchRequest) returns (SearchReply);
+}
+
+message SearchRequest {
+  // Query vector as raw little-endian f32 bytes (dim*4 bytes). Avoids the
+  // per-element protobuf float marshalling on both client and server.
+  bytes query = 1;
+  uint32 k = 2;
+}
+
+message SearchReply {
+  // Top-k engine _ids, concatenated; each id is a 16-byte big-endian decimal128.
+  bytes ids = 1;
+}

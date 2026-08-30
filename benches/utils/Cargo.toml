@@ -14,6 +14,30 @@ name = "profile_superfile"
 path = "bin/profile_superfile.rs"
 bench = false
 
+# Loopback throughput bench server (gRPC in front of the embedded engine).
+# Bench tooling only; this crate is publish = false so tonic/prost never reach
+# the published `infino` crate.
+[[bin]]
+name = "grpcserver"
+path = "bin/grpcserver.rs"
+bench = false
+
+# Raw-TCP throughput server (leanest wire; no tonic/HTTP2/tokio).
+[[bin]]
+name = "rawserver"
+path = "bin/rawserver.rs"
+bench = false
+
+# Async raw-TCP server (tokio epoll reactor + raw framing; no HTTP2).
+[[bin]]
+name = "rawasync"
+path = "bin/rawasync.rs"
+bench = false
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
+
 
 [dependencies]
 arrow-array = "58"
@@ -40,7 +64,9 @@ rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "time", "net", "io-util"] }
+tonic = "0.12"
+prost = "0.13"
 
 # RustFS local bench backend (`rustfs_server.rs`):
 # rcgen — generate bench-local TLS CA + server cert (no openssl CLI / sudo).
