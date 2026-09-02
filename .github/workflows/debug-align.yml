@@ -1,0 +1,28 @@
+name: Debug align macos-x86
+on:
+  workflow_dispatch:
+jobs:
+  repro:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5   # this fork's main = has the packed(8) change
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: Build wheel (packed(8) RowId align fix)
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: x86_64-apple-darwin
+          args: --release --locked --out dist -m infino-python/Cargo.toml
+      - name: Install wheel
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --force-reinstall dist/*.whl pytest
+      - name: Full suite (crash test)
+        run: |
+          set +e
+          python3 -m pytest infino-python/tests -v
+          code=$?
+          echo "=================== PYTEST_EXITCODE=$code ==================="
+          if [ $code -eq 0 ]; then echo "RESULT: PASS — packed(8) align fix KILLED the crash"; else echo "RESULT: FAIL (exit $code)"; fi

@@ -63,15 +63,45 @@ pub enum IdParseError {
 macro_rules! define_id_type {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[derive(Clone, Copy)]
+        #[repr(packed(8))]
         pub struct $name(pub i128);
+
+        // Field alignment is capped at 8 (via `packed(8)`) so the compiler never
+        // emits a 16-byte *aligned* SSE move (`movaps`) for the `i128` — that
+        // instruction #GP-faults when the async state machine lands the value on
+        // an 8-aligned frame slot on x86_64-apple-darwin (see infino#697). The
+        // `#[derive]`d comparison/hash/debug impls borrow the field (`&self.0`),
+        // which is illegal on a packed struct, so they are hand-written to read a
+        // *copy* of the field via a block expression.
+        impl PartialEq for $name {
+            fn eq(&self, other: &Self) -> bool {
+                let a = self.0;
+                let b = other.0;
+                a == b
+            }
+        }
+        impl Eq for $name {}
+        impl std::hash::Hash for $name {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                let v = self.0;
+                v.hash(state)
+            }
+        }
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let v = self.0;
+                write!(f, "{}({})", stringify!($name), v)
+            }
+        }
 
         impl $name {
             /// 32-char zero-padded lowercase hex of `self.0.to_be_bytes()`.
             /// Stable across releases — JSON payload format, so any
             /// change here is a wire-format change.
             pub fn to_hex(self) -> String {
-                let bytes = self.0.to_be_bytes();
+                let v = self.0;
+                let bytes = v.to_be_bytes();
                 let mut out = String::with_capacity(ID_HEX_LEN);
                 for b in bytes {
                     // `{:02x}` always emits two lowercase hex digits.
