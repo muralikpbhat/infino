@@ -5530,6 +5530,7 @@ mod tests {
         hidden
             .block_on_query(stamp_slow_vector_state(
                 hidden.inner(),
+                false,
                 Some(PendingDrainState {
                     metadata,
                     entries: Vec::new(),
@@ -5635,6 +5636,7 @@ mod tests {
         hidden
             .block_on_query(stamp_slow_vector_state(
                 hidden.inner(),
+                false,
                 Some(PendingDrainState {
                     metadata,
                     entries: Vec::new(),
@@ -6990,7 +6992,7 @@ mod tests {
         // + child superfiles — production does this at the end of `compact`.
         let hinner = hidden.inner().clone();
         hidden
-            .block_on_query(refresh_slow_vector_state(&hinner))
+            .block_on_query(refresh_slow_vector_state(&hinner, true))
             .expect("refresh slow state after split");
 
         // After the split the parent still holds the (now superseded) cell, yet
