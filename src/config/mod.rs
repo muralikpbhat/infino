@@ -922,6 +922,11 @@ impl Default for VectorSettings {
 pub struct DiagnosticsSettings {
     /// Accumulate per-phase timers during the vector drain build.
     pub drain_build_timers: bool,
+    /// Emit top-level optimize() phase timers ([optphase]: drain / split / merge
+    /// / recalibrate / settle / compact_total / router_cache) plus the merge
+    /// splice-vs-rebuild split ([optmerge]). Off by default; a measuring stick
+    /// for compaction scaling work.
+    pub optimize_phase_timers: bool,
     /// Emit the FTS builder's finish-phase profile.
     pub fts_profile: bool,
     /// Capture the object-store I/O timeline.
@@ -968,6 +973,7 @@ impl GcSettings {
 pub struct OptimizeOptions {
     pub(crate) compaction: CompactionSettings,
     pub(crate) gc: GcSettings,
+    pub(crate) recalibrate: RecalibratePolicy,
 }
 
 impl OptimizeOptions {
@@ -976,6 +982,7 @@ impl OptimizeOptions {
         Self {
             compaction: settings,
             gc: GcSettings::default(),
+            recalibrate: RecalibratePolicy::default(),
         }
     }
 
@@ -984,6 +991,32 @@ impl OptimizeOptions {
         self.gc = gc;
         self
     }
+
+    /// Override how `optimize()` handles probe-law recalibration (default
+    /// [`RecalibratePolicy::Auto`] when unset — backward compatible).
+    pub fn with_recalibrate(mut self, recalibrate: RecalibratePolicy) -> Self {
+        self.recalibrate = recalibrate;
+        self
+    }
+}
+
+/// How `optimize()` treats the probe-law recalibration — the O(N) query-serving
+/// calibration, separable from the storage-necessary drain/split/merge which
+/// always run. Storage work is unaffected by this; only recalibration is gated.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecalibratePolicy {
+    /// Engine decides: recalibrate when the live superfile set changed since the
+    /// pre-pass snapshot, or the rerank law lags its pool.
+    #[default]
+    Auto,
+    /// Always recalibrate this optimize, regardless of the Auto condition — for a
+    /// final optimize before serving, when the laws must reflect the full corpus.
+    Force,
+    /// Skip recalibration this optimize; the storage-necessary drain/split/merge
+    /// still run. For a repeated-optimize ingest loop where no query is served
+    /// until a later, deliberately recalibrated optimize.
+    Skip,
 }
 
 /// Persistent storage backend selected by [`StorageSettings`].

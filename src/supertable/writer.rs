@@ -3745,6 +3745,7 @@ async fn save_drain_remote_checkpoint(
         .map_err(|error| BuildError::Store(format!("drain checkpoint encode: {error}")))?;
     stamp_slow_vector_state(
         inner,
+        false,
         Some(slow_vector_state::PendingDrainState {
             metadata,
             entries: state.entries.clone(),
@@ -4031,7 +4032,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             {
                 tracing::warn!("drain local checkpoint cleanup failed: {error}");
             }
-            refresh_slow_vector_state(&hidden_inner).await?;
+            refresh_slow_vector_state(&hidden_inner, false).await?;
             schedule_background_storage_reclaim(Arc::clone(&hidden_inner));
             return Ok(());
         }
@@ -5284,8 +5285,17 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // Membership has settled: publish the slow-CAS entry blob and stamp its
     // ref (the per-batch `update`s cleared it). Hidden tables have no manifest
     // parts, so publication is required for reopen and cannot degrade to a
-    // warning.
-    refresh_slow_vector_state(&hidden_inner).await?;
+    // warning. `false`: the drain-tail settle publishes membership only and does
+    // NOT run the O(N) fanout calibration — compaction re-settles and calibrates
+    // (gated by policy), so calibrating here is redundant within an optimize.
+    let __ds = std::time::Instant::now();
+    refresh_slow_vector_state(&hidden_inner, false).await?;
+    if crate::config::global().diagnostics.optimize_phase_timers {
+        eprintln!(
+            "[optphase]   drain_settle {:.1}s",
+            __ds.elapsed().as_secs_f64()
+        );
+    }
     schedule_background_storage_reclaim(Arc::clone(&hidden_inner));
     Ok(())
 }
@@ -7205,6 +7215,7 @@ async fn pin_uploaded_superfiles(
     .map_err(|error| BuildError::Store(format!("split upload pin encode: {error}")))?;
     stamp_slow_vector_state(
         inner,
+        false,
         Some(slow_vector_state::PendingDrainState { metadata, entries }),
     )
     .await
@@ -7216,7 +7227,7 @@ async fn pin_uploaded_superfiles(
 /// never write one). The publish error wins; a failed unpin is logged and
 /// swallowed — the orphans then wait for the next stamp as before.
 async fn unpin_after_failed_publish(inner: &SupertableInner, error: BuildError) -> BuildError {
-    if let Err(unpin) = stamp_slow_vector_state(inner, None).await {
+    if let Err(unpin) = stamp_slow_vector_state(inner, false, None).await {
         debug!("split upload unpin after failed publish: {unpin}");
     }
     error
@@ -8930,8 +8941,9 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 )]
 pub(in crate::supertable) async fn refresh_slow_vector_state(
     inner: &SupertableInner,
+    calibrate_fanout: bool,
 ) -> Result<(), BuildError> {
-    stamp_slow_vector_state(inner, None).await
+    stamp_slow_vector_state(inner, calibrate_fanout, None).await
 }
 
 /// Build + PUT the centroid-router section for the settled generation AND
@@ -9444,6 +9456,12 @@ pub(in crate::supertable) async fn stamp_term_stats(
 /// present with a matching population key and reuses it (a no-op).
 pub(in crate::supertable) async fn stamp_slow_vector_state(
     inner: &SupertableInner,
+    // When false, skip the O(N) centroid-router fanout GT scan
+    // (`build_and_publish_centroid_router_section`) and carry the prior fanout /
+    // router section forward; the cheap membership publish still runs. The
+    // drain-tail settle passes false (compaction re-settles and calibrates), and
+    // compaction passes it per the caller's RecalibratePolicy (Skip -> false).
+    calibrate_fanout: bool,
     pending_drain: Option<slow_vector_state::PendingDrainState>,
 ) -> Result<(), BuildError> {
     let Some(storage) = inner.options.storage.clone() else {
@@ -9536,6 +9554,12 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
                     // router (and stamped its fanout) for THIS membership —
                     // reuse it, re-measure nothing.
                     Some(existing) => (Some(existing.clone()), None),
+                    // Fanout calibration gated off (bulk-ingest drain-tail, or a
+                    // Skip-policy compaction): skip the O(N) full-corpus fanout
+                    // GT scan and leave the ref unstamped (queries reconstruct the
+                    // router in memory; the prior fanout law carries forward). A
+                    // later Force/Auto settle measures it once.
+                    None if !calibrate_fanout => (None, None),
                     None => {
                         build_and_publish_centroid_router_section(
                             inner,
@@ -11385,7 +11409,7 @@ mod tests {
         assert_eq!(updated.entries.len(), 1);
         assert_eq!(updated.entries[0].superfile_id, pending_entry.superfile_id);
 
-        refresh_slow_vector_state(table.inner())
+        refresh_slow_vector_state(table.inner(), true)
             .await
             .expect("replace checkpoint with settled slow state");
         assert!(
