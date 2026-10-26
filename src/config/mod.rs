@@ -863,6 +863,41 @@ pub struct VectorSettings {
     /// For `ivf_router = centroid_graph`: the centroid-HNSW walk's `ef`
     /// (candidate breadth). `0` = auto (`fanout * 2`). Ignored otherwise.
     pub global_fine_graph_ef: usize,
+    /// For `ivf_router = centroid_graph`: build and walk the centroid graph
+    /// on 1-bit (sign-quantized) centroids instead of fp32. Shrinks the
+    /// resident centroid set ~32x — the lever for 1T-scale routing — at the
+    /// cost of a coarser walk. Off by default; the serve path rebuilds the
+    /// router fresh from resident centroids when this flips, so no persisted
+    /// fp32 topology is reused. Ignored otherwise.
+    pub global_fine_centroid_graph_1bit: bool,
+    /// Hybrid rescue for `global_fine_centroid_graph_1bit`: when > 1, the
+    /// 1-bit walk fetches `fanout * this` candidates and fp32 EXACT-rescores
+    /// them down to `fanout` (the admit path's 1-bit-shortlist → fp32-confirm,
+    /// applied to centroid routing). Recovers the recall pure 1-bit selection
+    /// loses at low sign-code resolution, dim-agnostically. `0`/`1` = off
+    /// (pure 1-bit). Ignored unless the 1-bit knob is on.
+    pub global_fine_centroid_graph_hybrid_widen: usize,
+    /// For the 1-bit hybrid: build the centroid-graph TOPOLOGY (edges) under
+    /// fp32 instead of 1-bit, so the walk follows true geometry and reaches
+    /// the real-neighbor clusters (the 1-bit walk then only orders within
+    /// reachable nodes, which the fp32 rescore fixes). Edges are built once at
+    /// drain where fp32 is free; only 1-bit codes stay resident for the walk.
+    /// Closes the coverage gap a 1-bit-built topology leaves. Off by default.
+    pub global_fine_centroid_graph_fp32_topology: bool,
+    /// For the 1-bit hybrid: admit candidates for fp32 refine by a self-measured
+    /// error bound instead of refining the whole `widen*fanout` set. Exact-scores
+    /// a top-k seed, measures the 1-bit-estimate-to-exact residual, and admits a
+    /// further candidate only if its estimate minus that residual could still
+    /// reach the k-th exact — so fp32 refine (and the on-demand fp32 fetch) touch
+    /// only the few clusters that could be top-k (turbopuffer's "<1% reranked").
+    /// `widen` then just sets the walk breadth. Off by default.
+    pub global_fine_centroid_graph_error_bound: bool,
+    /// For the 1-bit hybrid: generate candidates by a FLAT 1-bit scan over every
+    /// centroid instead of the HNSW walk. Full coverage (no mis-navigation) and,
+    /// at 1B-scale (~114k live centroids), ~1ms of Hamming — cheaper than a wide
+    /// walk whose ef heap churn dominates. The graph walk is for the true-1T
+    /// regime where a flat scan is too slow. Off by default.
+    pub global_fine_centroid_graph_flat_scan: bool,
     /// For `ivf_router = auto`: the concentration threshold. `auto` uses
     /// `centroid_graph` only when the calibrated fanout selects a real SUBSET
     /// of the fine clusters — `stamped_fanout < ratio × total_fine_clusters`.
@@ -1080,6 +1115,11 @@ impl Default for VectorSettings {
             global_fine_rerank_pool_floor: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_POOL_FLOOR,
             global_fine_coalesce: false,
             global_fine_graph_ef: 0,
+            global_fine_centroid_graph_1bit: false,
+            global_fine_centroid_graph_hybrid_widen: 0,
+            global_fine_centroid_graph_fp32_topology: false,
+            global_fine_centroid_graph_error_bound: false,
+            global_fine_centroid_graph_flat_scan: false,
             centroid_graph_concentration_ratio: DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,
             centroid_graph_scale_floor_docs: DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS,
             centroid_graph_max_fanout: DEFAULT_CENTROID_GRAPH_MAX_FANOUT,

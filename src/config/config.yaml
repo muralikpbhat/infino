@@ -273,7 +273,41 @@ vector:
   # breadth). 0 = auto (fanout * 2). Ignored under ivf_router = stamped.
   global_fine_graph_ef: 0
 
+  # For ivf_router = centroid_graph: build and walk the centroid graph on
+  # 1-bit (sign-quantized) centroids instead of fp32. Shrinks the resident
+  # centroid set ~32x (the 1T-scale lever) for a coarser walk. The serve path
+  # rebuilds the router fresh from resident centroids when this flips.
+  global_fine_centroid_graph_1bit: false
+
+  # Hybrid rescue for the 1-bit centroid graph: when > 1, the 1-bit walk
+  # proposes fanout*this candidates and fp32 exact-rescores them to fanout
+  # (admit-style 1-bit-shortlist -> fp32-confirm). Recovers recall lost to low
+  # sign-code resolution. 0/1 = off. Ignored unless the 1-bit knob is on.
+  global_fine_centroid_graph_hybrid_widen: 0
+
+  # 1-bit hybrid: build the centroid-graph topology (edges) under fp32 instead
+  # of 1-bit so the walk follows true geometry and reaches real-neighbor
+  # clusters (fp32 rescore then orders them). Edges built once at drain; only
+  # 1-bit codes stay resident for the walk. Closes the 1-bit-topology coverage
+  # gap. Off by default.
+  global_fine_centroid_graph_fp32_topology: false
+
+  # 1-bit hybrid: admit candidates for fp32 refine by a self-measured error
+  # bound (exact-score a top-k seed, measure the estimate-to-exact residual,
+  # admit further candidates whose estimate minus that residual could still
+  # reach the k-th exact) instead of refining the whole widen*fanout set. fp32
+  # refine + on-demand fetch then touch only the few could-be-top-k clusters.
+  # widen just sets the walk breadth. Off by default.
+  global_fine_centroid_graph_error_bound: false
+
+  # 1-bit hybrid: generate candidates by a flat 1-bit scan over every centroid
+  # instead of the HNSW walk. Full coverage, and at 1B-scale (~114k centroids)
+  # ~1ms of Hamming beats a wide walk's ef heap churn. The graph walk is for the
+  # true-1T regime where a flat scan is too slow. Off by default.
+  global_fine_centroid_graph_flat_scan: false
+
   # For ivf_router = auto: the concentration threshold. auto uses centroid_graph
+  # only when the calibrated fanout selects a real SUBSET of the fine clusters, auto uses centroid_graph
   # only when the calibrated fanout selects a real SUBSET of the fine clusters,
   # stamped_fanout < ratio * total_fine_clusters. A fanout clamped to ~ the
   # total leaves nothing for the graph to concentrate on -> stamped. Documented

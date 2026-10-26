@@ -841,7 +841,7 @@ fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
 /// index, flat cluster id)` the stamped per-cell read plan expects, so the
 /// downstream read is byte-identical.
 pub(crate) struct CentroidRouterGraph {
-    scorer: crate::superfile::vector::hnsw::Fp32Scorer,
+    scorer: CentroidScorer,
     graph: crate::superfile::vector::hnsw::Hnsw,
     /// `node_map[i] = (superfile index, per-superfile flat cluster)` for graph
     /// node `i`. Read by the recalibration to size the fanout ladder (node
@@ -852,6 +852,189 @@ pub(crate) struct CentroidRouterGraph {
     /// load. The query is transformed into the same space before the walk
     /// ([`gfc_prepare_for_metric`]), so build-time and query-time scoring agree.
     metric: Metric,
+}
+
+/// The centroid-graph's node scorer: fp32 by default, or 1-bit sign codes
+/// when `vector.global_fine_centroid_graph_1bit` is set (the 1T-scale
+/// lever). Both drive the SAME [`Hnsw`] topology type; the enum lets one
+/// `CentroidRouterGraph` hold either without making every caller generic.
+pub(crate) enum CentroidScorer {
+    Fp32(crate::superfile::vector::hnsw::Fp32Scorer),
+    Bit(crate::superfile::vector::hnsw::BitScorer),
+    /// Hybrid: walk the 1-bit graph at a widened fanout, then EXACT-rescore
+    /// the candidates with fp32 and keep the top-k. Mirrors the admit path's
+    /// 1-bit-shortlist → fp32-confirm (`score_fine_candidates`): the cheap
+    /// 1-bit walk proposes, fp32 disposes — dim-agnostic recovery of the
+    /// recall that pure 1-bit selection loses at low sign-code resolution.
+    BitHybrid {
+        bit: crate::superfile::vector::hnsw::BitScorer,
+        fp32: crate::superfile::vector::hnsw::Fp32Scorer,
+    },
+}
+
+impl CentroidScorer {
+    /// Walk `graph` for the top-`k` nearest centroid nodes under this scorer.
+    fn search(
+        &self,
+        graph: &crate::superfile::vector::hnsw::Hnsw,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Vec<(u32, f32)> {
+        use crate::superfile::vector::hnsw::NodeScorer;
+        match self {
+            CentroidScorer::Fp32(s) => graph.search(s, query, k, ef),
+            CentroidScorer::Bit(s) => graph.search(s, query, k, ef),
+            CentroidScorer::BitHybrid { bit, fp32 } => {
+                // 1-bit walk proposes a widened candidate set so the fp32-near
+                // clusters have a chance to be present even when 1-bit ranks
+                // them poorly; fp32 then exact-rescores and keeps the top-k.
+                let vcfg = &config::global().vector;
+                let widen = vcfg.global_fine_centroid_graph_hybrid_widen.max(1);
+                let m = k.saturating_mul(widen);
+                let ef2 = ef.max(m);
+                // Candidate set, ascending by 1-bit distance. Two front ends:
+                // FLAT SCAN scores every centroid on its 1-bit code (full
+                // coverage, no graph walk) — at 1B-scale the ~114k Hamming ops
+                // (~1ms) beat a wide HNSW walk (ef heap churn) AND avoid the
+                // low-dim mis-navigation that forces the walk wide. The GRAPH
+                // WALK is kept for the true-1T regime where a flat scan is too
+                // slow. Both feed the same error-bound refine below.
+                let cands = if vcfg.global_fine_centroid_graph_flat_scan {
+                    let bq = bit.prepare(query);
+                    let n = bit.len();
+                    let mut all: Vec<(u32, f32)> = (0..n as u32)
+                        .map(|node| (node, bit.score(&bq, node)))
+                        .collect();
+                    all.sort_by(|a, b| a.1.total_cmp(&b.1));
+                    // Cap at the GLOBAL top-`m` by 1-bit (full-coverage
+                    // generation from the whole scan, but a bounded candidate
+                    // set for the refine — vs the walk's locally-reached top-m).
+                    all.truncate(m);
+                    all
+                } else {
+                    graph.search(bit, query, m, ef2)
+                };
+                let q = fp32.prepare(query);
+                if !vcfg.global_fine_centroid_graph_error_bound {
+                    // Fixed-widen: exact-rescore ALL `m` candidates (upper bound
+                    // on recall for this walk breadth, but refines everything).
+                    let mut all: Vec<(u32, f32)> =
+                        cands.iter().map(|&(n, _)| (n, fp32.score(&q, n))).collect();
+                    all.sort_by(|a, b| a.1.total_cmp(&b.1));
+                    all.truncate(k);
+                    return all;
+                }
+                // Error-bound admission: exact-score only a top-k seed, measure
+                // the 1-bit-estimate-to-exact residual on it, and admit a further
+                // candidate only when its 1-bit estimate MINUS that residual could
+                // still beat the current k-th exact distance — so the fp32 refine
+                // (and Phase B's fetch) touches only the few clusters that could
+                // be top-k. Mirrors the #515 self-measured admit extension.
+                let seed_n = k.min(cands.len());
+                let mut scored: Vec<(u32, f32)> = Vec::with_capacity(cands.len());
+                let mut bound = 0.0f32; // max(est_distance − exact_distance) over the seed
+                for &(node, est) in cands.iter().take(seed_n) {
+                    let exact = fp32.score(&q, node);
+                    bound = bound.max(est - exact);
+                    scored.push((node, exact));
+                }
+                // Current k-th best exact among the seed = the admission cutoff.
+                scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+                let cutoff = scored
+                    .get(k.saturating_sub(1))
+                    .or_else(|| scored.last())
+                    .map(|&(_, d)| d)
+                    .unwrap_or(f32::INFINITY);
+                // Admit any further candidate whose best-possible exact
+                // (`est − bound`) could enter the top-k.
+                for &(node, est) in cands.iter().skip(seed_n) {
+                    if est - bound <= cutoff {
+                        scored.push((node, fp32.score(&q, node)));
+                    }
+                }
+                if std::env::var_os("INFINO_ADMIT_DUMP").is_some() {
+                    eprintln!(
+                        "[admit-dump] walked={} refined={} (seed={} k={})",
+                        cands.len(),
+                        scored.len(),
+                        seed_n,
+                        k
+                    );
+                }
+                scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+                scored.truncate(k);
+                scored
+            }
+        }
+    }
+}
+
+/// Build the centroid-router scorer + its HNSW from prepared centroids,
+/// honoring `vector.global_fine_centroid_graph_1bit`. The scorer variant and
+/// the graph are built together so the topology is laid out under the same
+/// distance the walk will use. `serial` picks the deterministic single-thread
+/// build (drain-side placement) over the parallel one.
+fn build_centroid_scorer_and_graph(
+    vecs: &[Vec<f32>],
+    dim: usize,
+    metric: Metric,
+    serial: bool,
+) -> (CentroidScorer, crate::superfile::vector::hnsw::Hnsw) {
+    use crate::superfile::vector::hnsw::{BitScorer, Fp32Scorer, Hnsw, HnswParams};
+    let vcfg = config::global();
+    if vcfg.vector.global_fine_centroid_graph_1bit {
+        let hybrid = vcfg.vector.global_fine_centroid_graph_hybrid_widen > 1;
+        let fp32_topology = vcfg.vector.global_fine_centroid_graph_fp32_topology;
+        let bit = BitScorer::from_vectors(vecs, dim, metric);
+        if hybrid {
+            // Hybrid: 1-bit walk + fp32 exact rescore. The TOPOLOGY (edges) can
+            // be laid out under fp32 (`fp32_topology`) so the walk follows the
+            // true geometry and reaches the real-neighbor clusters — the 1-bit
+            // walk then only has to ORDER within reachable nodes, which fp32
+            // rescore fixes. Edges are built once at drain where fp32 is free;
+            // only the 1-bit codes (walk) stay resident, fp32 centroids fetched
+            // on demand for the selected set.
+            let fp32 = Fp32Scorer::from_vectors(vecs, dim, metric);
+            let graph = if fp32_topology {
+                if serial {
+                    Hnsw::build_serial(&fp32, HnswParams::default())
+                } else {
+                    Hnsw::build(&fp32, HnswParams::default())
+                }
+            } else if serial {
+                Hnsw::build_serial(&bit, HnswParams::default())
+            } else {
+                Hnsw::build(&bit, HnswParams::default())
+            };
+            (CentroidScorer::BitHybrid { bit, fp32 }, graph)
+        } else {
+            let graph = if serial {
+                Hnsw::build_serial(&bit, HnswParams::default())
+            } else {
+                Hnsw::build(&bit, HnswParams::default())
+            };
+            (CentroidScorer::Bit(bit), graph)
+        }
+    } else {
+        let scorer = Fp32Scorer::from_vectors(vecs, dim, metric);
+        let graph = if serial {
+            Hnsw::build_serial(&scorer, HnswParams::default())
+        } else {
+            Hnsw::build(&scorer, HnswParams::default())
+        };
+        (CentroidScorer::Fp32(scorer), graph)
+    }
+}
+
+impl CentroidRouterGraph {
+    /// Walk the graph for the top-`k` nearest fine-centroid nodes under
+    /// whichever scorer this router holds. `query` is already metric-prepared
+    /// by the caller ([`gfc_prepare_for_metric`]); `ef` is the walk's
+    /// candidate breadth.
+    fn route(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u32, f32)> {
+        self.scorer.search(&self.graph, query, k, ef)
+    }
 }
 
 /// A [`CentroidRouterGraph`] stamped with the `(generation, column)` its nodes
@@ -917,7 +1100,7 @@ impl FineAssignRouter {
         // dedup when several fine centroids share a cell.
         let n_place = ((REPLICA_CLOSURE_MAX_REPLICAS + 1) * 8).min(graph.node_map.len().max(1));
         let ef = n_place.saturating_mul(2).max(n_place);
-        let hits = graph.graph.search(&graph.scorer, &q, n_place, ef);
+        let hits = graph.route(&q, n_place, ef);
         let n_cent = clusters.n_cent as usize;
         // Distinct, bounds-checked cells in walk order. `[0]` is the primary
         // (nearest fine centroid's cell); the rest are replica candidates.
@@ -1242,16 +1425,10 @@ fn build_centroid_router(
     serial: bool,
     superseded: Option<&BTreeMap<Uuid, BTreeSet<u32>>>,
 ) -> Result<CentroidRouterGraph, QueryError> {
-    use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
     let (vecs, node_map) = centroid_router_walk(
         superfiles, readers, column, column_id, section, metric, superseded,
     )?;
-    let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
-    let graph = if serial {
-        Hnsw::build_serial(&scorer, HnswParams::default())
-    } else {
-        Hnsw::build(&scorer, HnswParams::default())
-    };
+    let (scorer, graph) = build_centroid_scorer_and_graph(&vecs, dim, metric, serial);
     Ok(CentroidRouterGraph {
         scorer,
         graph,
@@ -1390,7 +1567,10 @@ fn decode_centroid_router_section(
         vecs.push(vec.clone());
         node_map.push((si, *flat));
     }
-    let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
+    // The persisted section carries fp32 topology; this path is bypassed when
+    // the 1-bit knob is on (the loader returns None, forcing a fresh rebuild),
+    // so re-derive the fp32 scorer to pair with that fp32 topology.
+    let scorer = CentroidScorer::Fp32(Fp32Scorer::from_vectors(&vecs, dim, metric));
     Some(CentroidRouterGraph {
         scorer,
         graph,
@@ -1475,7 +1655,6 @@ pub(crate) fn build_centroid_router_from_cluster_vectors(
     dim: usize,
     metric: Metric,
 ) -> Result<CentroidRouterGraph, QueryError> {
-    use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
     let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(cluster_vectors.len());
     let mut node_map: Vec<(usize, u32)> = Vec::with_capacity(cluster_vectors.len());
     for (si, flat, mut vec) in cluster_vectors {
@@ -1483,8 +1662,7 @@ pub(crate) fn build_centroid_router_from_cluster_vectors(
         vecs.push(vec);
         node_map.push((si, flat));
     }
-    let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
-    let graph = Hnsw::build(&scorer, HnswParams::default());
+    let (scorer, graph) = build_centroid_scorer_and_graph(&vecs, dim, metric, false);
     Ok(CentroidRouterGraph {
         scorer,
         graph,
@@ -1570,9 +1748,7 @@ pub(crate) fn build_router_fanout_selection(
             }
         }
         gfc_prepare_for_metric(metric, &mut q);
-        let mut hits = router
-            .graph
-            .search(&router.scorer, &q, max_fanout, graph_ef);
+        let mut hits = router.route(&q, max_fanout, graph_ef);
         // Nearest first — assign the selection rank by ascending distance.
         hits.sort_by(|a, b| a.1.total_cmp(&b.1));
         for (rank, (node, _)) in hits.iter().enumerate() {
@@ -4523,7 +4699,17 @@ impl SupertableReader {
                 fc.saturating_mul(2)
             }
             .max(fc);
-            let hits = router.graph.search(&router.scorer, &q, fc, ef);
+            let hits = router.route(&q, fc, ef);
+            // Diagnostic (INFINO_ROUTE_DUMP): emit the sorted selected fine-cluster
+            // node ids for THIS query, one line per query. Node ids index node_map
+            // and are stable across an fp32 vs 1-bit run of the same table, so two
+            // runs' lines can be compared per query to measure routing overlap.
+            if std::env::var_os("INFINO_ROUTE_DUMP").is_some() {
+                let mut nodes: Vec<u32> = hits.iter().map(|(n, _)| *n).collect();
+                nodes.sort_unstable();
+                let line: Vec<String> = nodes.iter().map(|n| n.to_string()).collect();
+                eprintln!("[route-dump] {}", line.join(","));
+            }
             // A selected fine cluster whose owning cell has been SUPERSEDED by an
             // in-place split points at dead on-disk blocks the whole-cell scan
             // paths filter out (see `postings_by_cell_from_summaries`); the graph
@@ -4805,6 +4991,12 @@ impl SupertableReader {
         readers: &[Arc<SuperfileReader>],
         section: &CentroidSection,
     ) -> Option<CentroidRouterGraph> {
+        // The persisted section carries an fp32-built topology. Under the 1-bit
+        // knob the router must be rebuilt fresh so both the topology and the
+        // walk run on sign codes; skip the persisted load to force that rebuild.
+        if config::global().vector.global_fine_centroid_graph_1bit {
+            return None;
+        }
         let manifest = self.manifest();
         let reference = manifest.slow_vector_state_centroid_graph_blob()?.clone();
         let storage = manifest.options.storage.as_ref()?;
@@ -4946,10 +5138,10 @@ impl SupertableReader {
             return None;
         }
         // Serial build so a retried/resumed drain that rebuilds the router from
-        // the same section scatters identical rows into identical cells.
-        use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
-        let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
-        let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+        // the same section scatters identical rows into identical cells. Honors
+        // the 1-bit knob so assign-from-scratch places rows under the same
+        // routing the queries will use.
+        let (scorer, graph) = build_centroid_scorer_and_graph(&vecs, dim, metric, true);
         let stamped = Arc::new(StampedCentroidRouter {
             generation: manifest.manifest_id,
             column: column.to_string(),
@@ -10264,8 +10456,7 @@ mod tests {
                 let fanout = 3usize;
                 let ef = fanout.saturating_mul(2).max(fanout);
                 let mut sel: Vec<(usize, u32)> = router
-                    .graph
-                    .search(&router.scorer, q, fanout, ef)
+                    .route(q, fanout, ef)
                     .into_iter()
                     .filter_map(|(node, _)| router.node_map.get(node as usize).copied())
                     .collect();
@@ -10497,8 +10688,7 @@ mod tests {
                 let fanout = 3usize;
                 let ef = fanout.saturating_mul(2).max(fanout);
                 let mut sel: Vec<(uuid::Uuid, u32)> = router
-                    .graph
-                    .search(&router.scorer, q, fanout, ef)
+                    .route(q, fanout, ef)
                     .into_iter()
                     .filter_map(|(node, _)| {
                         router

@@ -498,6 +498,158 @@ impl NodeScorer for Fp32Scorer {
     }
 }
 
+/// Fixed rotation seed for the 1-bit centroid graph. Build-side and
+/// query-side encoding share it so sign codes land in the same rotated
+/// space; a constant (not the per-table admit seed) keeps a rebuilt
+/// router over the same centroids byte-identical.
+const CENTROID_BIT_ROT_SEED: u64 = 0x_1B17_CE27_0A9D_51CE;
+
+/// 1-bit centroid node scorer: each centroid is rotated then sign-packed
+/// to one bit per dimension, and node distance is estimated from the
+/// Hamming distance between sign codes via a `cos(π·h/dim)` LUT scaled by
+/// the stored norms — the same RaBitQ estimator the flat admit scan uses
+/// ([`estimate_admit_scores_into`]), here driving the centroid-graph walk
+/// so the resident centroid set shrinks ~32x versus fp32 (the 1T lever).
+///
+/// [`estimate_admit_scores_into`]: crate::supertable::manifest
+pub(crate) struct BitScorer {
+    rotation: std::sync::Arc<crate::superfile::vector::rotation::RandomRotation>,
+    quant: crate::superfile::vector::quant::BitQuantizer,
+    /// `cos(π·h/dim)` for h in `0..=dim`.
+    cos_table: Vec<f32>,
+    /// `len × words_per_code` packed sign words, node-major.
+    codes: Vec<u64>,
+    /// Per-node `‖centroid‖` (post metric-prep), for the estimator's norm
+    /// scaling. Cosine centroids are unit-normalized upstream, so ~1.
+    norms: Vec<f32>,
+    words_per_code: usize,
+    dim: usize,
+    len: usize,
+    metric: Metric,
+}
+
+/// A query folded for [`BitScorer`]: its own packed sign code plus norms.
+pub(crate) struct BitQuery {
+    words: Vec<u64>,
+    norm: f32,
+    l2sq: f32,
+}
+
+impl BitScorer {
+    pub(crate) fn from_vectors(vectors: &[Vec<f32>], dim: usize, metric: Metric) -> Self {
+        use crate::superfile::vector::quant::BitQuantizer;
+        let rotation = std::sync::Arc::new(RandomRotation::new(dim, CENTROID_BIT_ROT_SEED));
+        let quant = BitQuantizer::new(dim);
+        let code_bytes = quant.code_bytes();
+        let words_per_code = code_bytes.div_ceil(8);
+        let cos_table: Vec<f32> = (0..=dim)
+            .map(|h| (std::f32::consts::PI * h as f32 / dim as f32).cos())
+            .collect();
+        let mut codes = Vec::with_capacity(vectors.len() * words_per_code);
+        let mut norms = Vec::with_capacity(vectors.len());
+        let mut rotated = vec![0.0f32; dim];
+        let mut code = vec![0u8; code_bytes];
+        for v in vectors {
+            debug_assert_eq!(v.len(), dim);
+            norms.push(v.iter().map(|x| x * x).sum::<f32>().sqrt());
+            rotation.apply(v, &mut rotated);
+            quant.encode_rotated_into(&rotated, &mut code);
+            pack_code_bytes_into_words(&code, words_per_code, &mut codes);
+        }
+        Self {
+            rotation,
+            quant,
+            cos_table,
+            codes,
+            norms,
+            words_per_code,
+            dim,
+            len: vectors.len(),
+            metric,
+        }
+    }
+
+    #[inline]
+    fn node_code(&self, node: u32) -> &[u64] {
+        let start = node as usize * self.words_per_code;
+        &self.codes[start..start + self.words_per_code]
+    }
+}
+
+impl NodeScorer for BitScorer {
+    type Prepared = BitQuery;
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn prepare(&self, query: &[f32]) -> BitQuery {
+        let mut rotated = vec![0.0f32; self.dim];
+        self.rotation.apply(query, &mut rotated);
+        let mut code = vec![0u8; self.quant.code_bytes()];
+        self.quant.encode_rotated_into(&rotated, &mut code);
+        let mut words = Vec::with_capacity(self.words_per_code);
+        pack_code_bytes_into_words(&code, self.words_per_code, &mut words);
+        let l2sq: f32 = query.iter().map(|x| x * x).sum();
+        BitQuery {
+            words,
+            norm: l2sq.sqrt(),
+            l2sq,
+        }
+    }
+
+    fn prepare_node(&self, node: u32) -> BitQuery {
+        let norm = self.norms[node as usize];
+        BitQuery {
+            words: self.node_code(node).to_vec(),
+            norm,
+            l2sq: norm * norm,
+        }
+    }
+
+    #[inline]
+    fn score(&self, q: &BitQuery, node: u32) -> f32 {
+        let h = hamming_words(&q.words, self.node_code(node)) as usize;
+        let node_norm = self.norms[node as usize];
+        let est_dot = self.cos_table[h] * q.norm * node_norm;
+        use crate::superfile::vector::distance::{COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF};
+        match self.metric {
+            Metric::Cosine => COSINE_DISTANCE_BASE - est_dot,
+            Metric::NegDot => -est_dot,
+            Metric::L2Sq => q.l2sq + node_norm * node_norm - L2_CROSS_TERM_COEFF * est_dot,
+        }
+    }
+}
+
+/// Pack `code` bytes (little-endian) into exactly `words_per_code` u64s,
+/// appending to `out`. The last word is zero-padded past the code bytes;
+/// `encode_rotated_into` already zeroes bits past `dim`, so padding never
+/// contributes to a Hamming count.
+#[inline]
+fn pack_code_bytes_into_words(code: &[u8], words_per_code: usize, out: &mut Vec<u64>) {
+    for w in 0..words_per_code {
+        let mut word = 0u64;
+        for b in 0..8 {
+            let idx = w * 8 + b;
+            if idx < code.len() {
+                word |= (code[idx] as u64) << (b * 8);
+            }
+        }
+        out.push(word);
+    }
+}
+
+/// Hamming distance between two equal-length packed sign codes.
+#[inline]
+fn hamming_words(a: &[u64], b: &[u64]) -> u32 {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+}
+
 /// Sq4 node scorer: one 4-bit code per ROTATED coordinate on a fitted
 /// per-coordinate ruler, two codes packed per byte (low nibble = even
 /// coordinate), with an optional second nibble plane carrying a sub-step
