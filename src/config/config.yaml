@@ -306,6 +306,14 @@ vector:
   # true-1T regime where a flat scan is too slow. Off by default.
   global_fine_centroid_graph_flat_scan: false
 
+  # Phase B (the memory win): the 1-bit hybrid router keeps only the 1-bit code
+  # slab resident and reads the proposed clusters' fp32 centroids ON-DEMAND from
+  # the NVMe-spilled CentroidSection for the refine, instead of holding the fp32
+  # fine centroids resident. Drops the resident routing set ~32x (fp32 -> 1-bit)
+  # — the difference between fitting and OOM at 10B+. No-op unless
+  # global_fine_centroid_graph_1bit is also set. Off by default.
+  global_fine_centroid_graph_ondemand_fp32: false
+
   # For ivf_router = auto: the concentration threshold. auto uses centroid_graph
   # only when the calibrated fanout selects a real SUBSET of the fine clusters, auto uses centroid_graph
   # only when the calibrated fanout selects a real SUBSET of the fine clusters,

@@ -854,6 +854,92 @@ pub(crate) struct CentroidRouterGraph {
     metric: Metric,
 }
 
+/// Phase B — the memory win. Instead of a resident [`Fp32Scorer`] holding
+/// every fine centroid in RAM, keep only per-node fetch keys + a handle to the
+/// (NVMe-spilled, page-cache-evictable) [`CentroidSection`], and read the fp32
+/// centroids of the PROPOSED candidate set on-demand for the refine. The
+/// resident routing set drops from the full fp32 centroids (~tens of GB at 10B)
+/// to the 1-bit slab — the difference between fitting and OOM at 10B+.
+///
+/// `fetch_keys[node] = (superfile_id, cell_id, local ordinal within the cell)`,
+/// computed at build (readers are available then) so the query path needs no
+/// reader. The refine batches the candidates by `(superfile_id, cell_id)`,
+/// reads each cell's fp32 bytes once via [`CentroidSection::read_cell_bytes`]
+/// (a page-cache-backed pread, not a resident copy), slices each candidate's
+/// centroid, metric-prepares it, and scores it through a SMALL throwaway
+/// [`Fp32Scorer`] over just the fetched subset — so the exact-rescore scoring
+/// is byte-identical to the resident path, only the storage changed.
+pub(crate) struct OnDemandFp32 {
+    section: std::sync::Arc<crate::supertable::slow_vector_state::CentroidSection>,
+    column_id: FieldId,
+    /// Per graph-node: `(superfile_id, cell_id, local ordinal within the cell)`.
+    fetch_keys: Vec<(uuid::Uuid, Option<u32>, u32)>,
+    dim: usize,
+    metric: Metric,
+}
+
+impl OnDemandFp32 {
+    /// Fetch the fp32 centroids of `nodes` from the section (grouped so each
+    /// cell's bytes are read at most once) and return `(node, metric-prepared
+    /// centroid)` pairs in `nodes` order. Nodes whose cell is absent/short are
+    /// skipped (defense-in-depth; the fetch keys are built from the same walk
+    /// the node map is).
+    fn fetch(&self, nodes: &[u32]) -> Vec<(u32, Vec<f32>)> {
+        let stride = self.dim * 4;
+        // Read each needed (superfile, cell) once; reused across nodes in it.
+        let mut cell_cache: HashMap<(uuid::Uuid, Option<u32>), Option<Vec<u8>>> = HashMap::new();
+        let mut out: Vec<(u32, Vec<f32>)> = Vec::with_capacity(nodes.len());
+        for &node in nodes {
+            let Some(&(sfid, cell_id, local)) = self.fetch_keys.get(node as usize) else {
+                continue;
+            };
+            let bytes = cell_cache.entry((sfid, cell_id)).or_insert_with(|| {
+                self.section
+                    .read_cell_bytes(sfid, self.column_id, cell_id)
+                    .ok()
+                    .flatten()
+            });
+            let Some(bytes) = bytes.as_ref() else {
+                continue;
+            };
+            let off = local as usize * stride;
+            let Some(slab) = bytes.get(off..off + stride) else {
+                continue;
+            };
+            let mut v: Vec<f32> = slab
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().expect("chunks_exact(4)")))
+                .collect();
+            gfc_prepare_for_metric(self.metric, &mut v);
+            out.push((node, v));
+        }
+        out
+    }
+
+    /// Exact-rescore the candidate `nodes` (ascending 1-bit distance ignored —
+    /// we re-rank by fp32) and return the top-`k` `(node, exact distance)`,
+    /// nearest first. Reads the candidates' fp32 on-demand; nothing fp32 is
+    /// held resident between queries.
+    fn refine_topk(&self, query: &[f32], nodes: &[u32], k: usize) -> Vec<(u32, f32)> {
+        use crate::superfile::vector::hnsw::{Fp32Scorer, NodeScorer};
+        let fetched = self.fetch(nodes);
+        if fetched.is_empty() {
+            return Vec::new();
+        }
+        let vecs: Vec<Vec<f32>> = fetched.iter().map(|(_, v)| v.clone()).collect();
+        let scorer = Fp32Scorer::from_vectors(&vecs, self.dim, self.metric);
+        let q = scorer.prepare(query);
+        let mut scored: Vec<(u32, f32)> = fetched
+            .iter()
+            .enumerate()
+            .map(|(i, &(node, _))| (node, scorer.score(&q, i as u32)))
+            .collect();
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+        scored.truncate(k);
+        scored
+    }
+}
+
 /// The centroid-graph's node scorer: fp32 by default, or 1-bit sign codes
 /// when `vector.global_fine_centroid_graph_1bit` is set (the 1T-scale
 /// lever). Both drive the SAME [`Hnsw`] topology type; the enum lets one
@@ -869,6 +955,15 @@ pub(crate) enum CentroidScorer {
     BitHybrid {
         bit: crate::superfile::vector::hnsw::BitScorer,
         fp32: crate::superfile::vector::hnsw::Fp32Scorer,
+    },
+    /// Phase B: like [`CentroidScorer::BitHybrid`] but the fp32 refine reads the
+    /// candidate centroids ON-DEMAND from the section instead of a resident
+    /// [`Fp32Scorer`]. The 1-bit propose is identical; only the refine's fp32
+    /// storage changed, so recall tracks the hybrid while the resident set is
+    /// just the 1-bit slab (the 10B/1T memory win).
+    BitOnDemand {
+        bit: crate::superfile::vector::hnsw::BitScorer,
+        fp32: OnDemandFp32,
     },
 }
 
@@ -900,21 +995,14 @@ impl CentroidScorer {
                 // low-dim mis-navigation that forces the walk wide. The GRAPH
                 // WALK is kept for the true-1T regime where a flat scan is too
                 // slow. Both feed the same error-bound refine below.
-                let cands = if vcfg.global_fine_centroid_graph_flat_scan {
-                    let bq = bit.prepare(query);
-                    let n = bit.len();
-                    let mut all: Vec<(u32, f32)> = (0..n as u32)
-                        .map(|node| (node, bit.score(&bq, node)))
-                        .collect();
-                    all.sort_by(|a, b| a.1.total_cmp(&b.1));
-                    // Cap at the GLOBAL top-`m` by 1-bit (full-coverage
-                    // generation from the whole scan, but a bounded candidate
-                    // set for the refine — vs the walk's locally-reached top-m).
-                    all.truncate(m);
-                    all
-                } else {
-                    graph.search(bit, query, m, ef2)
-                };
+                let cands = onebit_candidates(
+                    bit,
+                    graph,
+                    query,
+                    m,
+                    ef2,
+                    vcfg.global_fine_centroid_graph_flat_scan,
+                );
                 let q = fp32.prepare(query);
                 if !vcfg.global_fine_centroid_graph_error_bound {
                     // Fixed-widen: exact-rescore ALL `m` candidates (upper bound
@@ -966,7 +1054,55 @@ impl CentroidScorer {
                 scored.truncate(k);
                 scored
             }
+            CentroidScorer::BitOnDemand { bit, fp32 } => {
+                // Phase B: identical 1-bit propose, but the fp32 refine reads
+                // the candidates' centroids on-demand from the section — the
+                // resident set is just the 1-bit slab, not the fp32 centroids.
+                let vcfg = &config::global().vector;
+                let widen = vcfg.global_fine_centroid_graph_hybrid_widen.max(1);
+                let m = k.saturating_mul(widen);
+                let ef2 = ef.max(m);
+                let cands = onebit_candidates(
+                    bit,
+                    graph,
+                    query,
+                    m,
+                    ef2,
+                    vcfg.global_fine_centroid_graph_flat_scan,
+                );
+                let nodes: Vec<u32> = cands.iter().map(|&(n, _)| n).collect();
+                fp32.refine_topk(query, &nodes, k)
+            }
         }
+    }
+}
+
+/// Generate the 1-bit candidate set (ascending 1-bit distance) for the hybrid
+/// refine. FLAT SCAN scores every centroid on its sign code (full coverage, no
+/// mis-navigation) then caps at the global top-`m`; the GRAPH WALK reaches a
+/// local top-`m` at breadth `ef` and is kept for the true-1T regime where a
+/// flat scan over all centroids is too slow. Shared by the resident-refine
+/// (`BitHybrid`) and on-demand-refine (`BitOnDemand`) paths.
+fn onebit_candidates(
+    bit: &crate::superfile::vector::hnsw::BitScorer,
+    graph: &crate::superfile::vector::hnsw::Hnsw,
+    query: &[f32],
+    m: usize,
+    ef: usize,
+    flat_scan: bool,
+) -> Vec<(u32, f32)> {
+    use crate::superfile::vector::hnsw::NodeScorer;
+    if flat_scan {
+        let bq = bit.prepare(query);
+        let n = bit.len();
+        let mut all: Vec<(u32, f32)> = (0..n as u32)
+            .map(|node| (node, bit.score(&bq, node)))
+            .collect();
+        all.sort_by(|a, b| a.1.total_cmp(&b.1));
+        all.truncate(m);
+        all
+    } else {
+        graph.search(bit, query, m, ef)
     }
 }
 
@@ -1424,10 +1560,55 @@ fn build_centroid_router(
     metric: Metric,
     serial: bool,
     superseded: Option<&BTreeMap<Uuid, BTreeSet<u32>>>,
+    // Phase B: when the on-demand knob is on, the Arc the on-demand fp32 refine
+    // reads through. `None` for every non-query path (persist/recalibration/
+    // tests), which keeps the resident fp32 scorer.
+    ondemand_section: Option<std::sync::Arc<crate::supertable::slow_vector_state::CentroidSection>>,
 ) -> Result<CentroidRouterGraph, QueryError> {
     let (vecs, node_map) = centroid_router_walk(
         superfiles, readers, column, column_id, section, metric, superseded,
     )?;
+    let vcfg = &config::global().vector;
+    if let Some(section_arc) = ondemand_section
+        && vcfg.global_fine_centroid_graph_1bit
+        && vcfg.global_fine_centroid_graph_ondemand_fp32
+    {
+        // Phase B: resident = the 1-bit slab only; the fp32 refine reads the
+        // candidates' centroids from `section_arc` on demand. Per-node fetch
+        // keys (superfile_id, cell_id, local ordinal) are resolved here, while
+        // the readers are in hand — the query path then needs no reader.
+        use crate::superfile::vector::hnsw::{BitScorer, Hnsw, HnswParams};
+        let bit = BitScorer::from_vectors(&vecs, dim, metric);
+        let graph = if serial {
+            Hnsw::build_serial(&bit, HnswParams::default())
+        } else {
+            Hnsw::build(&bit, HnswParams::default())
+        };
+        let mut fetch_keys: Vec<(Uuid, Option<u32>, u32)> = Vec::with_capacity(node_map.len());
+        for &(si, flat) in &node_map {
+            let sfid = superfiles[si].superfile_id;
+            let vr = readers[si].vec();
+            let cell_id = vr.and_then(|v| v.global_cell_of_flat(flat));
+            let local = vr
+                .and_then(|v| v.resolve_flat_cluster(flat))
+                .map(|(_, local)| local)
+                .unwrap_or(0);
+            fetch_keys.push((sfid, cell_id, local));
+        }
+        let fp32 = OnDemandFp32 {
+            section: section_arc,
+            column_id,
+            fetch_keys,
+            dim,
+            metric,
+        };
+        return Ok(CentroidRouterGraph {
+            scorer: CentroidScorer::BitOnDemand { bit, fp32 },
+            graph,
+            node_map,
+            metric,
+        });
+    }
     let (scorer, graph) = build_centroid_scorer_and_graph(&vecs, dim, metric, serial);
     Ok(CentroidRouterGraph {
         scorer,
@@ -1622,6 +1803,7 @@ pub(crate) async fn compose_centroid_router_section(
         metric,
         false,
         manifest.get_superseded_cells(),
+        None,
     ) {
         Ok(router) => router,
         Err(error) => {
@@ -4680,7 +4862,7 @@ impl SupertableReader {
                     metric,
                     superfiles,
                     &readers,
-                    section.as_ref(),
+                    &section,
                     // Query-side selection: the parallel build is fine (the
                     // router only ranks clusters, never places rows).
                     false,
@@ -4923,7 +5105,7 @@ impl SupertableReader {
         metric: Metric,
         superfiles: &[Arc<SuperfileEntry>],
         readers: &[Arc<SuperfileReader>],
-        section: &CentroidSection,
+        section: &Arc<CentroidSection>,
         serial_build: bool,
     ) -> Result<Arc<StampedCentroidRouter>, QueryError> {
         let manifest = self.manifest();
@@ -4943,7 +5125,14 @@ impl SupertableReader {
             return Ok(entry);
         }
         let graph = match self
-            .load_persisted_centroid_router(column, dim, metric, superfiles, readers, section)
+            .load_persisted_centroid_router(
+                column,
+                dim,
+                metric,
+                superfiles,
+                readers,
+                section.as_ref(),
+            )
             .await
         {
             Some(graph) => graph,
@@ -4956,11 +5145,12 @@ impl SupertableReader {
                     readers,
                     column,
                     column_id,
-                    section,
+                    section.as_ref(),
                     dim,
                     metric,
                     serial_build,
                     manifest.get_superseded_cells(),
+                    Some(Arc::clone(section)),
                 )?
             }
         };
@@ -5055,13 +5245,7 @@ impl SupertableReader {
         }
         let readers = self.open_superfile_readers(&entries).await?;
         self.resident_centroid_router(
-            column,
-            generation,
-            dim,
-            metric,
-            &entries,
-            &readers,
-            section.as_ref(),
+            column, generation, dim, metric, &entries, &readers, &section,
             // Eager serving-side warm: parallel build (selection only).
             false,
         )
@@ -10479,6 +10663,7 @@ mod tests {
                     metric,
                     false,
                     None,
+                    None,
                 )
                 .expect("build_centroid_router");
                 assert!(!built.node_map.is_empty(), "fixture must produce a router");
@@ -10574,6 +10759,7 @@ mod tests {
                     Metric::Cosine,
                     false,
                     ss,
+                    None,
                 )
                 .expect("router build")
                 .node_map
@@ -10656,6 +10842,7 @@ mod tests {
                 dim,
                 Metric::Cosine,
                 false,
+                None,
                 None,
             )
             .expect("build_centroid_router");
@@ -10776,7 +10963,7 @@ mod tests {
                     Metric::Cosine,
                     &entries,
                     &readers,
-                    section.as_ref(),
+                    &section,
                     false,
                 )
                 .await

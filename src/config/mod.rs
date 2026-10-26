@@ -898,6 +898,15 @@ pub struct VectorSettings {
     /// walk whose ef heap churn dominates. The graph walk is for the true-1T
     /// regime where a flat scan is too slow. Off by default.
     pub global_fine_centroid_graph_flat_scan: bool,
+    /// Phase B — the memory win. When set, the 1-bit-hybrid router does NOT
+    /// hold the fp32 fine centroids resident: it keeps only the 1-bit code slab
+    /// (BitScorer) plus per-node fetch keys, and reads the proposed clusters'
+    /// fp32 centroids ON-DEMAND from the (NVMe-spilled, page-cache-evictable)
+    /// CentroidSection for the refine. The resident routing set drops ~32×
+    /// (fp32 centroids → 1-bit), which is the difference between fitting and
+    /// OOM at 10B+. No-op unless `global_fine_centroid_graph_1bit` is also set.
+    /// Off by default.
+    pub global_fine_centroid_graph_ondemand_fp32: bool,
     /// For `ivf_router = auto`: the concentration threshold. `auto` uses
     /// `centroid_graph` only when the calibrated fanout selects a real SUBSET
     /// of the fine clusters — `stamped_fanout < ratio × total_fine_clusters`.
@@ -1120,6 +1129,7 @@ impl Default for VectorSettings {
             global_fine_centroid_graph_fp32_topology: false,
             global_fine_centroid_graph_error_bound: false,
             global_fine_centroid_graph_flat_scan: false,
+            global_fine_centroid_graph_ondemand_fp32: false,
             centroid_graph_concentration_ratio: DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,
             centroid_graph_scale_floor_docs: DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS,
             centroid_graph_max_fanout: DEFAULT_CENTROID_GRAPH_MAX_FANOUT,
