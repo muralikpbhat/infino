@@ -938,6 +938,84 @@ impl OnDemandFp32 {
         scored.truncate(k);
         scored
     }
+
+    /// Error-bound refine: fetch + exact-score only the clusters that could be
+    /// top-`k`, instead of all `m` candidates. `cands` is `(node, 1-bit est)`
+    /// ASCENDING by est. Seed the exact scores from the top-`k` by est, measure
+    /// the 1-bit-to-exact residual `bound = max(est − exact)` on that seed, then
+    /// admit a further candidate only while `est − bound ≤` the k-th seed exact
+    /// (early-stop: `cands` is sorted, so once it fails it fails for all later).
+    /// So the on-demand fetch touches seed + a handful, keeping the fetch — and
+    /// thus the latency — flat as the candidate set grows with scale. Mirrors
+    /// the resident BitHybrid error-bound path; the scoring is identical, only
+    /// fp32 is read on-demand rather than held resident.
+    fn refine_topk_error_bound(
+        &self,
+        query: &[f32],
+        cands: &[(u32, f32)],
+        k: usize,
+    ) -> Vec<(u32, f32)> {
+        use crate::superfile::vector::hnsw::{Fp32Scorer, NodeScorer};
+        if cands.is_empty() {
+            return Vec::new();
+        }
+        let est_of: HashMap<u32, f32> = cands.iter().copied().collect();
+        let score_batch = |nodes: &[u32]| -> Vec<(u32, f32)> {
+            let fetched = self.fetch(nodes);
+            if fetched.is_empty() {
+                return Vec::new();
+            }
+            let vecs: Vec<Vec<f32>> = fetched.iter().map(|(_, v)| v.clone()).collect();
+            let scorer = Fp32Scorer::from_vectors(&vecs, self.dim, self.metric);
+            let q = scorer.prepare(query);
+            fetched
+                .iter()
+                .enumerate()
+                .map(|(i, &(node, _))| (node, scorer.score(&q, i as u32)))
+                .collect()
+        };
+        let seed_n = k.min(cands.len());
+        let seed_nodes: Vec<u32> = cands[..seed_n].iter().map(|&(n, _)| n).collect();
+        let mut scored = score_batch(&seed_nodes);
+        // bound = max(est − exact) over the seed; cutoff = k-th seed exact.
+        let mut bound = 0.0f32;
+        for &(node, exact) in &scored {
+            if let Some(&est) = est_of.get(&node) {
+                bound = bound.max(est - exact);
+            }
+        }
+        let mut by_dist = scored.clone();
+        by_dist.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let cutoff = by_dist
+            .get(k.saturating_sub(1))
+            .or_else(|| by_dist.last())
+            .map(|&(_, d)| d)
+            .unwrap_or(f32::INFINITY);
+        // Admit further candidates (est ascending) until est − bound exceeds cutoff.
+        let mut admitted: Vec<u32> = Vec::new();
+        for &(node, est) in cands.iter().skip(seed_n) {
+            if est - bound <= cutoff {
+                admitted.push(node);
+            } else {
+                break;
+            }
+        }
+        if !admitted.is_empty() {
+            scored.extend(score_batch(&admitted));
+        }
+        if std::env::var_os("INFINO_ADMIT_DUMP").is_some() {
+            eprintln!(
+                "[admit-dump-ondemand] cands={} fetched={} (seed={} k={})",
+                cands.len(),
+                scored.len(),
+                seed_n,
+                k
+            );
+        }
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+        scored.truncate(k);
+        scored
+    }
 }
 
 /// The centroid-graph's node scorer: fp32 by default, or 1-bit sign codes
@@ -1070,8 +1148,14 @@ impl CentroidScorer {
                     ef2,
                     vcfg.global_fine_centroid_graph_flat_scan,
                 );
-                let nodes: Vec<u32> = cands.iter().map(|&(n, _)| n).collect();
-                fp32.refine_topk(query, &nodes, k)
+                if vcfg.global_fine_centroid_graph_error_bound {
+                    // Admit only the clusters that could be top-k → the fetch
+                    // (and latency) stays flat as the candidate set grows.
+                    fp32.refine_topk_error_bound(query, &cands, k)
+                } else {
+                    let nodes: Vec<u32> = cands.iter().map(|&(n, _)| n).collect();
+                    fp32.refine_topk(query, &nodes, k)
+                }
             }
         }
     }
